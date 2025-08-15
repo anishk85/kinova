@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+import rospy
+import logging
+import os
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PointStamped
+from cv_bridge import CvBridge
+from tf2_geometry_msgs import do_transform_point
+import tf2_ros
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import json
+from std_msgs.msg import String
+
+class KeyDetector:
+    def __init__(self, debug=False):
+        self.debug = debug
+        rospy.init_node("key_detector", log_level=rospy.INFO)
+        logging.basicConfig(level=logging.INFO)
+        
+        rospy.loginfo("Initializing PURE YOLO Key Detector")
+        
+        self.camera_input = rospy.get_param('~input_topic', '/camera/color/image_raw')
+        self.camera_info_topic = rospy.get_param('~camera_info_topic', '/camera/color/camera_info')
+        self.depth_topic = rospy.get_param('~depth_topic', '/camera/depth/image_rect_raw')
+        self.camera_frame = rospy.get_param('~camera_frame', 'camera_color_optical_frame')
+        self.base_frame = rospy.get_param('~base_frame', 'base_link')
+        self.show_visualization = rospy.get_param('~show_visualization', True)
+        
+        rospy.logdebug("Loading YOLO model")
+        model_path = rospy.get_param('~model_path', '/root/ros_ws/src/niwesh/kinova_urc_arm/kortex_examples/src/trained_yolov8n.pt')
+        rospy.loginfo(f"Loading YOLO model from {model_path}")
+        self.model = YOLO(model_path)
+        logging.getLogger("ultralytics").setLevel(logging.ERROR)
+        
+        self.detection_confidence = rospy.get_param('~confidence', 0.3)
+        self.min_key_area = rospy.get_param('~min_key_area', 100)
+        
+        rospy.sleep(1)
+
+        self.bridge = CvBridge()
+        self.image_subscriber = rospy.Subscriber(self.camera_input, Image, self.image_callback)
+        self.depth_subscriber = rospy.Subscriber(self.depth_topic, Image, self.depth_callback)
+        self.camera_info_subscriber = rospy.Subscriber(self.camera_info_topic, CameraInfo, self.camera_info_callback)
+        
+        self.annotated_image_pub = rospy.Publisher("/annotated_keyboard", Image, queue_size=10)
+        self.key_coordinates_pub = rospy.Publisher("/key_coordinates", String, queue_size=10)
+        self.detection_stats_pub = rospy.Publisher("/detection_stats", String, queue_size=10)
+        
+        self.current_image = None
+        self.depth_image = None
+        self.camera_info = None
+        self.detected_keys = []
+        self.detected_keypoints_3d = {}
+        self.latest_annotated_image = None
+        self.yolo_detection_image = None
+        
+        self.image_received = False
+        self.depth_received = False
+        self.camera_info_received = False
+        self.frame_count = 0
+        
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        
+        self.visualization_ready = False
+        if self.show_visualization:
+            self.setup_visualization()
+        
+        rospy.loginfo("Pure YOLO Key Detector initialized")
+        self.detection_timer = rospy.Timer(rospy.Duration(1.0), self.calculate_3d_coordinates)
+
+    # All of your helper methods like setup_visualization, callbacks, yolo detection,
+    # and annotation are excellent. They are included here without changes.
+
+    def setup_visualization(self):
+        try:
+            if 'DISPLAY' in os.environ:
+                cv2.namedWindow("YOLO Key Detections", cv2.WINDOW_AUTOSIZE)
+                cv2.namedWindow("Annotated Keys", cv2.WINDOW_AUTOSIZE)
+                self.visualization_ready = True
+                rospy.loginfo("✅ OpenCV visualization windows created")
+            else:
+                rospy.logwarn("No DISPLAY environment variable. Disabling visualization.")
+                self.show_visualization = False
+        except Exception as e:
+            rospy.logwarn(f"OpenCV visualization failed: {e}")
+            self.show_visualization = False
+
+    def image_callback(self, msg):
+        self.frame_count += 1
+        try:
+            self.current_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            if not self.image_received:
+                rospy.loginfo(f"✅ First image received: {msg.width}x{msg.height}")
+            self.image_received = True
+            
+            if self.frame_count % 2 == 0:
+                self.detected_keys = self.detect_keys_with_yolo(self.current_image)
+                self.create_annotated_visualization()
+        except Exception as e:
+            rospy.logerr(f"Error in image callback: {e}")
+
+    def depth_callback(self, msg):
+        try:
+            if msg.encoding == "16UC1":
+                self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="16UC1")
+            elif msg.encoding == "32FC1":
+                self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1")
+            else:
+                return
+            if not self.depth_received:
+                rospy.loginfo(f"✅ First depth image received: {msg.width}x{msg.height}")
+            self.depth_received = True
+        except Exception as e:
+            rospy.logerr(f"Error in depth callback: {e}")
+
+    def camera_info_callback(self, msg):
+        if not self.camera_info_received:
+             rospy.loginfo(f"✅ Camera info received. IMPORTANT: Using TF frame '{msg.header.frame_id}' for calculations.")
+             # Override parameter with actual frame_id from camera
+             self.camera_frame = msg.header.frame_id
+        self.camera_info = msg
+        self.camera_info_received = True
+
+    def detect_keys_with_yolo(self, img):
+        # This function is well-written and remains unchanged.
+        detected_keys = []
+        if img is None: return detected_keys
+        try:
+            results = self.model(img, stream=True, conf=self.detection_confidence, verbose=False)
+            yolo_vis_img = img.copy()
+            detection_count = 0
+            for result in results:
+                if result.boxes:
+                    for i, box in enumerate(result.boxes):
+                        xyxy = box.xyxy[0].cpu().numpy()
+                        x1, y1, x2, y2 = map(int, xyxy)
+                        center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+                        area = (x2 - x1) * (y2 - y1)
+                        if area < self.min_key_area: continue
+                        confidence = float(box.conf[0]) if hasattr(box, 'conf') and len(box.conf) > 0 else 0.0
+                        
+                        key_obj = {'id': f"key_{detection_count:02d}", 'bbox': [x1, y1, x2, y2], 'center': [center_x, center_y], 'confidence': confidence}
+                        detected_keys.append(key_obj)
+                        
+                        color = (0, 255, 0)
+                        cv2.rectangle(yolo_vis_img, (x1, y1), (x2, y2), color, 2)
+                        label = f"{key_obj['id']} ({confidence:.2f})"
+                        cv2.putText(yolo_vis_img, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        detection_count += 1
+            self.yolo_detection_image = yolo_vis_img
+            return detected_keys
+        except Exception as e:
+            rospy.logerr(f"Error in YOLO detection: {e}")
+            return []
+
+    def create_annotated_visualization(self):
+        # This function is well-written and remains unchanged.
+        if self.current_image is None: return
+        annotated_img = self.current_image.copy()
+        for key in self.detected_keys:
+            x1, y1, x2, y2 = key['bbox']
+            center_x, center_y = key['center']
+            cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.circle(annotated_img, (center_x, center_y), 5, (0, 0, 255), -1)
+            cv2.putText(annotated_img, key['id'], (center_x + 10, center_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        info_text = f"Detected Keys: {len(self.detected_keys)}"
+        cv2.putText(annotated_img, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2, cv2.LINE_AA)
+        cv2.putText(annotated_img, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1, cv2.LINE_AA)
+        
+        self.latest_annotated_image = annotated_img
+        try:
+            self.annotated_image_pub.publish(self.bridge.cv2_to_imgmsg(annotated_img, "bgr8"))
+        except Exception as e:
+            rospy.logerr(f"Error publishing annotated image: {e}")
+
+    def _display_opencv_windows(self):
+        # This function is fine, but it will be called from the main loop now.
+        if not self.visualization_ready: return
+        try:
+            if self.yolo_detection_image is not None:
+                cv2.imshow("YOLO Key Detections", self.yolo_detection_image)
+            if self.latest_annotated_image is not None:
+                cv2.imshow("Annotated Keys", self.latest_annotated_image)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                rospy.signal_shutdown("User requested shutdown")
+            elif key == ord('s') and self.latest_annotated_image is not None:
+                filename = f"key_detection_{rospy.Time.now().to_nsec()}.jpg"
+                cv2.imwrite(filename, self.latest_annotated_image)
+                rospy.loginfo(f"Saved image: {filename}")
+        except Exception as e:
+            rospy.logwarn(f"Error in OpenCV display: {e}")
+
+    def get_3d_position_from_depth(self, pixel_x, pixel_y):
+        # This function is well-written and remains unchanged.
+        if self.depth_image is None or self.camera_info is None or self.current_image is None: return None
+        try:
+            color_h, color_w = self.current_image.shape[:2]
+            depth_h, depth_w = self.depth_image.shape[:2]
+            depth_x = int(pixel_x * depth_w / color_w)
+            depth_y = int(pixel_y * depth_h / color_h)
+            if not (0 <= depth_x < depth_w and 0 <= depth_y < depth_h): return None
+
+            depth = self.depth_image[depth_y, depth_x]
+            if self.depth_image.dtype == np.uint16: depth = depth / 1000.0
+            if depth <= 0.1 or np.isnan(depth): return None
+            
+            fx, fy, cx, cy = self.camera_info.K[0], self.camera_info.K[4], self.camera_info.K[2], self.camera_info.K[5]
+            x = (pixel_x - cx) * depth / fx
+            y = (pixel_y - cy) * depth / fy
+            return [x, y, depth]
+        except Exception as e:
+            rospy.logerr(f"Error getting 3D position: {e}")
+            return None
+
+    # --- FIX 2a: Re-introducing the transform function ---
+    def transform_to_base_frame(self, camera_position):
+        """Transforms a 3D point from the camera frame to the base frame."""
+        if camera_position is None: return None
+        try:
+            camera_point = PointStamped()
+            camera_point.header.frame_id = self.camera_frame
+            camera_point.header.stamp = rospy.Time(0)
+            camera_point.point.x, camera_point.point.y, camera_point.point.z = camera_position
+            
+            transform = self.tf_buffer.lookup_transform(self.base_frame, self.camera_frame, rospy.Time(0), rospy.Duration(1.0))
+            base_point_stamped = do_transform_point(camera_point, transform)
+            
+            return [base_point_stamped.point.x, base_point_stamped.point.y, base_point_stamped.point.z]
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn_throttle(5, f"TF transform failed from '{self.camera_frame}' to '{self.base_frame}': {e}")
+            return None
+
+    def calculate_3d_coordinates(self, event=None):
+        if not self.detected_keys or self.depth_image is None: return
+        
+        rospy.loginfo(f"Calculating 3D coordinates for {len(self.detected_keys)} keys...")
+        temp_3d_points = {}
+        successful_calculations = 0
+        
+        for key_obj in self.detected_keys:
+            key_id = key_obj['id']
+            center_x, center_y = key_obj['center']
+            camera_pos = self.get_3d_position_from_depth(center_x, center_y)
+            
+            if camera_pos:
+                # --- FIX 2b: Transform the point to the base frame ---
+                base_pos = self.transform_to_base_frame(camera_pos)
+                
+                temp_3d_points[key_id] = {
+                    'pixel_position': [center_x, center_y],
+                    'camera_position': camera_pos,
+                    'base_position': base_pos, # Can be None if transform fails
+                    'confidence': key_obj['confidence']
+                }
+                if base_pos:
+                    successful_calculations += 1
+        
+        self.detected_keypoints_3d = temp_3d_points
+        if successful_calculations > 0:
+            rospy.loginfo(f"✅ Successfully calculated and transformed {successful_calculations} keys.")
+            self.publish_coordinates()
+
+    def publish_coordinates(self):
+        if self.detected_keypoints_3d:
+            json_msg = json.dumps({'keys': self.detected_keypoints_3d}, indent=2)
+            self.key_coordinates_pub.publish(String(data=json_msg))
+
+    def run(self):
+        rospy.loginfo("=== PURE YOLO KEY DETECTOR LAUNCHED ===")
+        rospy.loginfo("Waiting for camera data...")
+
+        # Wait for initial data with a timeout
+        while not all([self.image_received, self.depth_received, self.camera_info_received]) and not rospy.is_shutdown():
+            rospy.loginfo_once("Waiting for image, depth, and camera_info topics...")
+            rospy.sleep(0.5)
+
+        rospy.loginfo("✅ All camera data received. Detection active!")
+        
+        # --- FIX 1: Replaced rospy.spin() with a proper while loop for visualization ---
+        rate = rospy.Rate(15) # 15 Hz
+        while not rospy.is_shutdown():
+            if self.show_visualization:
+                self._display_opencv_windows()
+            
+            rate.sleep()
+            
+        # Cleanup
+        if self.show_visualization:
+            cv2.destroyAllWindows()
+            rospy.loginfo("OpenCV windows closed.")
+
+def main():
+    try:
+        detector = KeyDetector(debug=False)
+        detector.run()
+    except rospy.ROSInterruptException:
+        rospy.loginfo("Key Detector interrupted")
+    except Exception as e:
+        rospy.logerr(f"Fatal Error in main: {e}")
+
+if __name__ == "__main__":
+    main()

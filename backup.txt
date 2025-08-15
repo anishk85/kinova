@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+import rospy
+import logging
+import os  # Add this import at the top
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PointStamped
+from cv_bridge import CvBridge
+from tf2_geometry_msgs import do_transform_point
+import tf2_ros
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import json
+from std_msgs.msg import String
+import threading
+
+class KeyDetector:
+    def __init__(self, debug=False):
+        self.debug = debug
+        if self.debug:
+            rospy.init_node("key_detector", log_level=rospy.DEBUG)
+            logging.basicConfig(level=logging.DEBUG)
+        else:
+            rospy.init_node("key_detector", log_level=rospy.INFO)
+            logging.basicConfig(level=logging.INFO)
+        
+        rospy.loginfo("Initializing Key Detector")
+        
+        # Initialize variables
+        self.KEYBOARD_LENGTH = 354.076
+        self.KEYBOARD_WIDTH = 123.444
+        
+        # Load keyboard layout
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        json_path = os.path.join(current_dir, 'keyboard_layout.json')
+        with open(json_path, 'r') as f:
+            rospy.loginfo(f"Loading keyboard points from {json_path}")
+            self.keyboard_points = json.load(f)
+        
+        # Parameters - Fix depth topic to match available topics
+        self.camera_input = rospy.get_param('~input_topic', '/camera/color/image_raw')
+        self.camera_info_topic = rospy.get_param('~camera_info_topic', '/camera/color/camera_info')
+        self.depth_topic = rospy.get_param('~depth_topic', '/camera/depth/image_rect_raw')
+        self.camera_frame = rospy.get_param('~camera_frame', 'camera_color_frame')  # Fixed frame name
+        self.base_frame = rospy.get_param('~base_frame', 'base_link')
+        self.show_visualization = rospy.get_param('~show_visualization', False)
+        
+        rospy.logdebug("Loading YOLO model")
+        model_path = rospy.get_param('~model_path', '/root/ros_ws/src/niwesh/kinova_urc_arm/kortex_examples/src/trained_yolov8n.pt')
+        rospy.loginfo(f"Loading YOLO model from {model_path}")
+        self.model = YOLO(model_path)
+        logging.getLogger("ultralytics").setLevel(logging.ERROR)
+        rospy.sleep(1)
+
+        # Subscribers
+        self.bridge = CvBridge()
+        self.image_subscriber = rospy.Subscriber(self.camera_input, Image, self.image_callback)
+        self.depth_subscriber = rospy.Subscriber(self.depth_topic, Image, self.depth_callback)
+        self.camera_info_subscriber = rospy.Subscriber(self.camera_info_topic, CameraInfo, self.camera_info_callback)
+        
+        # Publishers
+        self.annotated_image_pub = rospy.Publisher("/annotated_keyboard", Image, queue_size=10)
+        self.key_coordinates_pub = rospy.Publisher("/key_coordinates", String, queue_size=10)
+        
+        # Initialize variables with better tracking
+        self.current_image = None
+        self.depth_image = None
+        self.camera_info = None
+        self.detected_keypoints = None
+        self.keyboard_points_3d = None
+        self.latest_annotated_image = None
+        
+        # Add data received flags for better debugging
+        self.image_received = False
+        self.depth_received = False
+        self.camera_info_received = False
+        
+        # TF setup
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        
+        # Setup OpenCV windows only if visualization is enabled and we're not in a container
+        if self.show_visualization:
+            try:
+                # Test if display is available
+                if 'DISPLAY' in os.environ:
+                    cv2.namedWindow("YOLO Detections", cv2.WINDOW_AUTOSIZE)
+                    cv2.namedWindow("Key Detection", cv2.WINDOW_AUTOSIZE)
+                    rospy.loginfo("OpenCV visualization windows created")
+                else:
+                    rospy.logwarn("No DISPLAY environment variable - disabling visualization")
+                    self.show_visualization = False
+            except Exception as e:
+                rospy.logwarn(f"Failed to create OpenCV windows: {e}")
+                self.show_visualization = False
+        
+        rospy.loginfo("Key Detector initialized")
+        rospy.loginfo(f"Subscribed to:")
+        rospy.loginfo(f"  - Image: {self.camera_input}")
+        rospy.loginfo(f"  - Depth: {self.depth_topic}")
+        rospy.loginfo(f"  - Camera Info: {self.camera_info_topic}")
+        
+        # Timer for periodic 3D coordinate calculation
+        self.detection_timer = rospy.Timer(rospy.Duration(1.0), self.calculate_3d_coordinates)
+
+    def image_callback(self, msg):
+        rospy.logdebug("Image callback triggered")
+        try:
+            # Handle different image encodings
+            if msg.encoding == 'rgb8':
+                self.current_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            else:
+                self.current_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            
+            self.image_received = True
+            if not hasattr(self, '_image_logged'):
+                rospy.loginfo(f"✅ First image received: {msg.width}x{msg.height}, encoding: {msg.encoding}")
+                self._image_logged = True
+                
+            self.detected_keypoints, corners = self.process_image(self.current_image)
+            self.display_annotated_image(self.current_image, corners)
+            
+            # Show visualization if enabled (remove threading to avoid Qt issues)
+            if self.show_visualization and self.current_image is not None:
+                self._display_opencv_windows()
+                
+        except Exception as e:
+            rospy.logerr(f"Error in image callback: {e}")
+
+    def depth_callback(self, msg):
+        rospy.logdebug("Depth callback triggered")
+        try:
+            # Handle different depth encodings
+            if msg.encoding == "16UC1":
+                self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="16UC1")
+            elif msg.encoding == "32FC1":
+                self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1")
+            else:
+                rospy.logwarn(f"Unsupported depth encoding: {msg.encoding}")
+                
+            self.depth_received = True
+            if not hasattr(self, '_depth_logged'):
+                rospy.loginfo(f"✅ First depth image received: {msg.width}x{msg.height}, encoding: {msg.encoding}")
+                self._depth_logged = True
+                
+        except Exception as e:
+            rospy.logerr(f"Error in depth callback: {e}")
+            
+    def camera_info_callback(self, msg):
+        rospy.logdebug("Camera info callback triggered")
+        self.camera_info = msg
+        self.camera_info_received = True
+        if not hasattr(self, '_info_logged'):
+            rospy.loginfo(f"✅ Camera info received: {msg.width}x{msg.height}")
+            self._info_logged = True
+
+    def process_image(self, img):
+        """Process image to detect keyboard and extract key positions"""
+        rospy.logdebug("Processing image")
+        scaled_points = {}
+        corners = []
+        
+        if img is None:
+            return scaled_points, corners
+
+        try:
+            # Run YOLO detection
+            results = self.model(img, stream=True, conf=0.3, verbose=False)
+            
+            # Create visualization image showing raw YOLO detections
+            yolo_vis_img = img.copy()
+            
+            all_points = []
+            detection_count = 0
+            
+            # Collect corner points of ALL detected keys and visualize them
+            for result in results:
+                if result.boxes:
+                    for box in result.boxes:
+                        points = box.xyxy[0].cpu().numpy()
+                        x1, y1, x2, y2 = points
+                        all_points.extend([(x1, y1), (x2, y2)])
+                        detection_count += 1
+                        
+                        # Draw bounding box for each detection
+                        cv2.rectangle(yolo_vis_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                        
+                        # Add detection number
+                        cv2.putText(yolo_vis_img, f'Key #{detection_count}', 
+                                   (int(x1), int(y1) - 10), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        
+                        # Add confidence score if available
+                        if hasattr(box, 'conf') and len(box.conf) > 0:
+                            conf = float(box.conf[0])
+                            cv2.putText(yolo_vis_img, f'Conf: {conf:.2f}', 
+                                       (int(x1), int(y2) + 15), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+            # Store YOLO visualization for display
+            self.yolo_detection_image = yolo_vis_img
+            
+            # Log detection status periodically
+            if detection_count > 0:
+                rospy.loginfo(f"YOLO detected {detection_count} key regions")
+            elif not hasattr(self, '_no_detection_logged'):
+                rospy.loginfo("No key detections found")
+                self._no_detection_logged = True
+            
+            # If we detected at least one key, proceed with keyboard mapping
+            if all_points:
+                # Find the min/max coordinates to create one large bounding box
+                all_x = [p[0] for p in all_points]
+                all_y = [p[1] for p in all_points]
+                
+                master_x1, master_y1 = min(all_x), min(all_y)
+                master_x2, master_y2 = max(all_x), max(all_y)
+                
+                box_length = master_x2 - master_x1
+                box_width = master_y2 - master_y1
+
+                # Check for a valid bounding box size
+                if box_length > 50 and box_width > 30:
+                    rospy.loginfo(f"Keyboard bounding box - Length: {box_length:.1f}, Width: {box_width:.1f}")
+                    corners = [(int(master_x1), int(master_y1)), (int(master_x2), int(master_y1)), 
+                              (int(master_x2), int(master_y2)), (int(master_x1), int(master_y2))]
+
+                    # Scale the keys from the JSON layout to the detected bounding box
+                    key_count = 0
+                    for key, value in self.keyboard_points.items():
+                        try:
+                            scaled_x = (float(value[0]) / self.KEYBOARD_LENGTH) * box_length + master_x1
+                            scaled_y = (float(value[1]) / self.KEYBOARD_WIDTH) * box_width + master_y1
+                            scaled_points[key] = [int(scaled_x), int(scaled_y)]
+                            key_count += 1
+                        except (ValueError, IndexError) as e:
+                            rospy.logwarn(f"Error scaling key '{key}': {e}")
+                    
+                    # Log detected keys and their pixel coordinates
+                    if scaled_points:
+                        rospy.loginfo(f"Successfully mapped {len(scaled_points)} keys to keyboard layout")
+                        # Show sample of detected keys
+                        sample_keys = list(scaled_points.items())[:5]
+                        for key, pos in sample_keys:
+                            rospy.loginfo(f"  {key}: pixel({pos[0]}, {pos[1]})")
+                        if len(scaled_points) > 5:
+                            rospy.loginfo(f"  ... and {len(scaled_points) - 5} more keys")
+            
+            return scaled_points, corners
+
+        except Exception as e:
+            rospy.logerr(f"Error in process_image: {e}")
+            return {}, []
+
+    def display_annotated_image(self, img, corners):
+        """Display the annotated image with detected keyboard and key positions"""
+        rospy.logdebug("Creating annotated image")
+        
+        # Create a copy for annotation
+        annotated_img = img.copy()
+        
+        # Draw keyboard bounding box if detected
+        if len(corners) == 4:
+            # Draw bounding box
+            for i in range(4):
+                cv2.line(annotated_img, corners[i], corners[(i+1) % 4], (0, 255, 0), 3)
+            # Add keyboard detection label
+            cv2.putText(annotated_img, "KEYBOARD DETECTED", 
+                       (corners[0][0], corners[0][1] - 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        
+        # Draw key positions with labels
+        if self.detected_keypoints:
+            rospy.loginfo(f"Drawing {len(self.detected_keypoints)} detected keys on image")
+            
+            # Common keys to highlight with different colors
+            important_keys = ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', 
+                             'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l',
+                             'z', 'x', 'c', 'v', 'b', 'n', 'm', 'space']
+            
+            for i, (key, position) in enumerate(self.detected_keypoints.items()):
+                x, y = int(position[0]), int(position[1])
+                
+                # Choose color based on key type
+                if key.lower() in important_keys:
+                    circle_color = (0, 0, 255)  # Red for letters
+                    text_color = (255, 255, 255)  # White text
+                else:
+                    circle_color = (255, 0, 0)  # Blue for others
+                    text_color = (255, 255, 0)  # Cyan text
+                
+                # Draw circle for key position
+                cv2.circle(annotated_img, (x, y), 8, circle_color, -1)
+                cv2.circle(annotated_img, (x, y), 12, (255, 255, 255), 2)
+                
+                # Add key label with background for better visibility
+                text = str(key)
+                text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+                text_x = x + 15
+                text_y = y - 5
+                
+                # Ensure text stays within image bounds
+                if text_x + text_size[0] > annotated_img.shape[1]:
+                    text_x = x - text_size[0] - 15
+                if text_y - text_size[1] < 0:
+                    text_y = y + text_size[1] + 15
+                
+                # Draw text background rectangle
+                cv2.rectangle(annotated_img, 
+                             (text_x - 2, text_y - text_size[1] - 2),
+                             (text_x + text_size[0] + 2, text_y + 2),
+                             (0, 0, 0), -1)
+                # Draw text
+                cv2.putText(annotated_img, text, (text_x, text_y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 2)
+        
+        # Add comprehensive detection info
+        num_keys = len(self.detected_keypoints) if self.detected_keypoints else 0
+        info_lines = [
+            f"Detected Keys: {num_keys}",
+            f"Keyboard Found: {'YES' if len(corners) == 4 else 'NO'}",
+            f"Frame: {getattr(self, 'frame_count', 0) if hasattr(self, 'frame_count') else 'N/A'}"
+        ]
+        
+        for i, info_text in enumerate(info_lines):
+            y_pos = 30 + (i * 25)
+            # White text with black outline
+            cv2.putText(annotated_img, info_text, (10, y_pos), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 3)
+            cv2.putText(annotated_img, info_text, (10, y_pos), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
+        
+        # Store for OpenCV display
+        self.latest_annotated_image = annotated_img
+        
+        # Convert and publish annotated image
+        try:
+            annotated_msg = self.bridge.cv2_to_imgmsg(annotated_img, encoding="bgr8")
+            self.annotated_image_pub.publish(annotated_msg)
+            rospy.logdebug("Published annotated image")
+        except Exception as e:
+            rospy.logerr(f"Error publishing annotated image: {e}")
+
+    def _display_opencv_windows(self):
+        """Display OpenCV windows with better error handling"""
+        try:
+            # Display YOLO detections with resize for better viewing
+            if hasattr(self, 'yolo_detection_image') and self.yolo_detection_image is not None:
+                display_img = self.yolo_detection_image.copy()
+                h, w = display_img.shape[:2]
+                if w > 800:
+                    scale = 800.0 / w
+                    new_w = int(w * scale)
+                    new_h = int(h * scale)
+                    display_img = cv2.resize(display_img, (new_w, new_h))
+                cv2.imshow("YOLO Detections", display_img)
+            
+            # Display key detection results with resize for better viewing
+            if self.latest_annotated_image is not None:
+                display_img = self.latest_annotated_image.copy()
+                h, w = display_img.shape[:2]
+                if w > 800:
+                    scale = 800.0 / w
+                    new_w = int(w * scale)
+                    new_h = int(h * scale)
+                    display_img = cv2.resize(display_img, (new_w, new_h))
+                cv2.imshow("Key Detection", display_img)
+            
+            # Process OpenCV events (non-blocking)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                rospy.loginfo("'q' pressed - shutting down")
+                rospy.signal_shutdown("User requested shutdown")
+            elif key == ord('s') and self.latest_annotated_image is not None:
+                filename = f"/tmp/key_detection_{rospy.Time.now().to_nsec()}.jpg"
+                cv2.imwrite(filename, self.latest_annotated_image)
+                rospy.loginfo(f"Saved image: {filename}")
+            elif key == ord('d'):  # 'd' for debug info
+                if self.detected_keypoints:
+                    rospy.loginfo("=== DEBUG: Current detected keys ===")
+                    for key, pos in self.detected_keypoints.items():
+                        rospy.loginfo(f"  {key}: ({pos[0]}, {pos[1]})")
+                    
+        except Exception as e:
+            rospy.logwarn(f"Error in OpenCV display: {e}")
+
+    def get_3d_position_from_depth(self, pixel_x, pixel_y):
+        """Get 3D position from pixel coordinates using depth image"""
+        if self.depth_image is None or self.camera_info is None:
+            return None
+            
+        try:
+            # Scale coordinates from color image to depth image resolution
+            color_height, color_width = self.current_image.shape[:2] if self.current_image is not None else (720, 1280)
+            depth_height, depth_width = self.depth_image.shape[:2]
+            
+            # Scale pixel coordinates to depth image size
+            depth_x = int(pixel_x * depth_width / color_width)
+            depth_y = int(pixel_y * depth_height / color_height)
+            
+            # Ensure coordinates are within depth image bounds
+            depth_x = max(0, min(depth_x, depth_width - 1))
+            depth_y = max(0, min(depth_y, depth_height - 1))
+            
+            # Get depth value at scaled pixel location
+            if self.depth_image.dtype == np.uint16:
+                depth = self.depth_image[depth_y, depth_x] / 1000.0  # Convert mm to m
+            else:
+                depth = self.depth_image[depth_y, depth_x]
+            
+            if depth <= 0 or np.isnan(depth):
+                rospy.logdebug(f"Invalid depth value {depth} at scaled position ({depth_x}, {depth_y})")
+                return None
+            
+            # Get camera intrinsics (these are for the color camera)
+            fx = self.camera_info.K[0]
+            fy = self.camera_info.K[4]
+            cx = self.camera_info.K[2]
+            cy = self.camera_info.K[5]
+            
+            # Convert to 3D coordinates in camera frame using original pixel coordinates
+            x = (pixel_x - cx) * depth / fx
+            y = (pixel_y - cy) * depth / fy
+            z = depth
+            
+            return [x, y, z]
+            
+        except Exception as e:
+            rospy.logerr(f"Error getting 3D position from depth: {e}")
+            return None
+
+    def transform_to_base_frame(self, camera_position):
+        """Transform position from camera frame to base frame"""
+        if camera_position is None:
+            return None
+            
+        try:
+            # Create point in camera frame
+            camera_point = PointStamped()
+            camera_point.header.frame_id = self.camera_frame
+            camera_point.header.stamp = rospy.Time(0)
+            camera_point.point.x = camera_position[0]
+            camera_point.point.y = camera_position[1]
+            camera_point.point.z = camera_position[2]
+            
+            # Wait for transform
+            transform = self.tf_buffer.lookup_transform(
+                self.base_frame, self.camera_frame, 
+                rospy.Time(0), rospy.Duration(1.0)
+            )
+            
+            # Transform point
+            base_point = do_transform_point(camera_point, transform)
+            
+            return [base_point.point.x, base_point.point.y, base_point.point.z]
+            
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, 
+                tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn(f"Transform lookup failed: {e}")
+            return None
+
+    def calculate_3d_coordinates(self, event=None):
+        """Calculate 3D coordinates for all detected keys"""
+        if not self.detected_keypoints or self.depth_image is None:
+            rospy.logdebug("No keypoints detected or depth image unavailable")
+            return
+        
+        rospy.loginfo(f"Calculating 3D coordinates for {len(self.detected_keypoints)} detected keys...")
+        self.keyboard_points_3d = {}
+        successful_transforms = 0
+        
+        for key, pixel_pos in self.detected_keypoints.items():
+            # Get 3D position in camera frame
+            camera_pos = self.get_3d_position_from_depth(pixel_pos[0], pixel_pos[1])
+            
+            if camera_pos is not None:
+                # Try to transform to base frame first, fall back to camera frame
+                base_pos = self.transform_to_base_frame(camera_pos)
+                if base_pos is not None:
+                    self.keyboard_points_3d[key] = base_pos
+                    successful_transforms += 1
+                    rospy.loginfo(f"Key '{key}': Pixel({pixel_pos[0]:.0f}, {pixel_pos[1]:.0f}) -> "
+                                f"Base({base_pos[0]:.3f}, {base_pos[1]:.3f}, {base_pos[2]:.3f})")
+                else:
+                    # Fall back to camera coordinates
+                    self.keyboard_points_3d[key] = camera_pos
+                    successful_transforms += 1
+                    rospy.loginfo(f"Key '{key}': Pixel({pixel_pos[0]:.0f}, {pixel_pos[1]:.0f}) -> "
+                                f"Camera({camera_pos[0]:.3f}, {camera_pos[1]:.3f}, {camera_pos[2]:.3f})")
+        
+        if successful_transforms > 0:
+            rospy.loginfo(f"Successfully calculated 3D coordinates for {successful_transforms} keys")
+            self.publish_coordinates()
+        else:
+            rospy.logwarn("No successful 3D coordinate calculations")
+
+    def publish_coordinates(self):
+        """Publish the 3D coordinates as a JSON string"""
+        if self.keyboard_points_3d:
+            # Convert numpy arrays to lists for JSON serialization
+            coordinates_dict = {}
+            for key, position in self.keyboard_points_3d.items():
+                if isinstance(position, np.ndarray):
+                    coordinates_dict[key] = position.tolist()
+                else:
+                    coordinates_dict[key] = position
+            
+            # Create JSON message
+            json_msg = json.dumps(coordinates_dict, indent=2)
+            
+            # Publish
+            msg = String()
+            msg.data = json_msg
+            self.key_coordinates_pub.publish(msg)
+            
+            rospy.loginfo(f"Published 3D coordinates for {len(coordinates_dict)} keys")
+            
+            # Also log to console for debugging
+            rospy.loginfo("Current 3D Key Coordinates:")
+            for key, pos in coordinates_dict.items():
+                rospy.loginfo(f"  {key}: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+
+    def run(self):
+        """Main loop to keep the node running"""
+        rospy.loginfo("Key Detector node is running...")
+        rospy.loginfo("Waiting for camera data...")
+        
+        if self.show_visualization:
+            rospy.loginfo("OpenCV visualization enabled:")
+            rospy.loginfo("  - Press 'q' to quit visualization")
+            rospy.loginfo("  - Press 's' to save current image")
+        
+        # Wait for all required data with better logging
+        data_check_timer = 0
+        while not rospy.is_shutdown():
+            if data_check_timer % 10 == 0:  # Log every 5 seconds
+                rospy.loginfo(f"Data status - Image: {self.image_received}, Depth: {self.depth_received}, Info: {self.camera_info_received}")
+            
+            if (self.image_received and self.depth_received and self.camera_info_received):
+                rospy.loginfo("✅ All camera data received. Key detection active.")
+                break
+                
+            rospy.sleep(0.5)
+            data_check_timer += 1
+        
+        # Keep the node alive
+        try:
+            rospy.spin()
+        except KeyboardInterrupt:
+            rospy.loginfo("Shutting down Key Detector node...")
+        finally:
+            # Clean up OpenCV windows
+            if self.show_visualization:
+                cv2.destroyAllWindows()
+                rospy.loginfo("OpenCV windows closed")
+def main():
+    try:
+        detector = KeyDetector(debug=False)
+        detector.run()
+    except rospy.ROSInterruptException:
+        rospy.loginfo("Key Detector node interrupted")
+    except Exception as e:
+        rospy.logerr(f"Error in main: {e}")
+
+if __name__ == "__main__":
+    main()
