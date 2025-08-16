@@ -1,0 +1,22 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/niweshsah/ros_kinova_ws/devel/lib/python3/dist-packages",
+        "/home/niweshsah/xarm_ws/devel/lib/python3/dist-packages",
+        "/opt/ros/noetic/lib/python3/dist-packages",
+        "/home/niweshsah/robo_arm_new_ws/devel/lib/python3/dist-packages",
+        "/home/niweshsah/robo_arm_new_ws/devel/lib/python3/dist-packages",
+        "/home/niweshsah/robo_arm_new_ws/devel/lib/python3/dist-packages",
+        "/home/niweshsah/robo_arm_new_ws/devel/lib/python3/dist-packages",
+        "/home/niweshsah/robo_arm_new_ws/devel/lib/python3/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/niweshsah/ros_kinova_ws/devel/lib/python3/dist-packages",
+        "/home/niweshsah/xarm_ws/devel/lib/python3/dist-packages",
+        "/opt/ros/noetic/lib/python3/dist-packages",
+        "/home/niweshsah/robo_arm_new_ws/devel/lib/python3/dist-packages",
+        "/home/niweshsah/robo_arm_new_ws/devel/lib/python3/dist-packages",
+        "/home/niweshsah/robo_arm_new_ws/devel/lib/python3/dist-packages",
+        "/home/niweshsah/robo_arm_new_ws/devel/lib/python3/dist-packages",
+        "/home/niweshsah/robo_arm_new_ws/devel/lib/python3/dist-packages"
+    ]
+}

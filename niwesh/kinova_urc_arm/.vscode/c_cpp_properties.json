@@ -1,0 +1,30 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${default}",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/home/niweshsah/ros_kinova_ws/devel/include/**",
+        "/home/niweshsah/xarm_ws/devel/include/**",
+        "/opt/ros/noetic/include/**",
+        "/home/niweshsah/ros_kinova_ws/src/third_party/gazebo-pkgs/gazebo_grasp_plugin/include/**",
+        "/home/niweshsah/ros_kinova_ws/src/third_party/gazebo-pkgs/gazebo_version_helpers/include/**",
+        "/home/niweshsah/ros_kinova_ws/src/kortex_driver/include/**",
+        "/home/niweshsah/ros_kinova_ws/src/third_party/roboticsgroup_upatras_gazebo_plugins/include/**",
+        "/home/niweshsah/xarm_ws/src/xarm_ros/xarm_api/include/**",
+        "/home/niweshsah/xarm_ws/src/xarm_ros/xarm_controller/include/**",
+        "/home/niweshsah/xarm_ws/src/xarm_ros/xarm_moveit_servo/include/**",
+        "/home/niweshsah/xarm_ws/src/yolo_camera_pkg/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ROS",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++14"
+    }
+  ],
+  "version": 4
+}

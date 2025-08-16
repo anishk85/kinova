@@ -1,0 +1,11 @@
+moveit_setup_assistant_config:
+  URDF:
+    package: kortex_description
+    relative_path: arms/gen3/7dof/urdf/GEN3-7DOF-VISION_ARM_URDF_V12.urdf
+    xacro_args: ""
+  SRDF:
+    relative_path: config/GEN3-7DOF-VISION_ARM_URDF_V12.srdf
+  CONFIG:
+    author_name: niwesh sah
+    author_email: sahniwesh@gmail.com
+    generated_timestamp: 1738160265
