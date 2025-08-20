@@ -40,7 +40,7 @@ class RoboticTypingController:
 
         self.press_depth = 0.003
         self.dwell_time = 0.2
-        self.approach_height = 0.02
+        self.approach_height = 0.05
         self.safe_height = 0.05
 
         self.setup_vision()
@@ -174,8 +174,8 @@ class RoboticTypingController:
         self.move_group.set_num_planning_attempts(10)
         self.move_group.allow_replanning(True)
         
-        # self.move_group.set_max_velocity_scaling_factor(0.3)  # 30% max speed
-        # self.move_group.set_max_acceleration_scaling_factor(0.3)  # 30% max acceleration
+        self.move_group.set_max_velocity_scaling_factor(0.1)  # 30% max speed
+        self.move_group.set_max_acceleration_scaling_factor(0.1)  # 30% max acceleration
         
         self.move_group.set_goal_position_tolerance(0.002)  
         self.move_group.set_goal_orientation_tolerance(0.1)  
@@ -379,10 +379,11 @@ class RoboticTypingController:
                                 rospy.logdebug(f"Detected key '{key_name}' at ({center_x}, {center_y}) confidence: {confidence:.2f}")
                         
                         # Print detected keys periodically
-                        if detected_keys_list:
-                            rospy.loginfo_throttle(2, f"🔍 Detected keys: {detected_keys_list}")
+                        # if detected_keys_list:
+                        #     rospy.loginfo_throttle(2, f"🔍 Detected keys: {detected_keys_list}")
                         
                         # Calculate overall keyboard region
+
                         if keypoints_2d:
                             all_x = [pos[0] for pos in keypoints_2d.values()]
                             all_y = [pos[1] for pos in keypoints_2d.values()]
@@ -944,7 +945,7 @@ class RoboticTypingController:
             self.move_group.stop()
             self.move_group.clear_pose_targets()
             
-            self.move_to_home_position()
+            # self.move_to_home_position()
             
             moveit_commander.roscpp_shutdown()
             
@@ -978,6 +979,5 @@ if __name__ == "__main__":
 
 
     
-
 
 
