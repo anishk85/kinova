@@ -12,6 +12,17 @@
 
 # Kortex Examples
 
+```bash
+roslaunch kortex_driver kortex_driver.launch
+roslaunch kinova_vision kinova_vision.launch
+rosrun kortex_examples keyboard.py
+rosrun rqt_image_view rqt_image_view
+rostopic pub /type_text std_msgs/String "data: 'v'"
+```
+
+
+
+
 <!-- MarkdownTOC -->
 
 1. [Before running an example](#first_of_all)

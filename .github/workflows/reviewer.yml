@@ -1,0 +1,97 @@
+# .github/workflows/code_review.yml
+
+name: AI Code Review
+
+# This action will trigger on every pull request that targets the 'main' branch
+on:
+  pull_request:
+    branches:
+      - main
+
+# Permissions needed for the job to run
+permissions:
+  contents: read      # To check out the code
+  pull-requests: write # To write comments on the PR
+
+jobs:
+  review:
+    runs-on: ubuntu-latest # Use the latest version of Ubuntu for the runner
+    steps:
+      # Step 1: Check out the repository code
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          # We need to fetch the full history to be able to diff against the base branch
+          fetch-depth: 0
+
+      # Step 2: Get the code changes (the "diff")
+      - name: Get Pull Request Diff
+        id: get_diff
+        run: |
+          # This git command gets the difference between the PR branch and the main branch
+          # and stores it in a file that the next step will read.
+          git diff origin/main...HEAD > diff.txt
+
+      # Step 3: Run the AI Review using Gemini
+      - name: Run AI Code Review
+        id: ai_review
+        run: |
+          # Read the diff from the file.
+          DIFF_CONTENT=$(cat diff.txt)
+
+          # Construct the full prompt that will be sent to the AI.
+          PROMPT="""
+          You are an expert code reviewer for a software development team.
+          Your task is to review the following code changes from a pull request.
+          Please provide a concise, high-level summary of the changes, followed by specific, actionable feedback.
+          Focus on potential bugs, performance issues, security vulnerabilities, and violations of best practices.
+          Do NOT comment on minor style issues. Format your entire response as clean Markdown.
+
+          Here is the git diff for you to review:
+          ---
+          $DIFF_CONTENT
+          ---
+          """
+          
+          # Use jq to safely construct the JSON payload.
+          # This is the correct way to handle multi-line strings and special characters
+          # and it permanently fixes the "Invalid JSON payload" error.
+          JSON_PAYLOAD=$(jq -n --arg prompt_text "$PROMPT" \
+            '{ "contents": [ { "parts": [ { "text": $prompt_text } ] } ] }')
+
+          # Make the API call to Gemini.
+          # We pipe the JSON payload to curl's stdin and use -d @- to read from it.
+          API_RESPONSE=$(echo "$JSON_PAYLOAD" | curl -s -X POST -H "Content-Type: application/json" \
+            -d @- \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${{ secrets.GEMINI_API_KEY }}")
+          
+          # Store the raw response in a file for safer debugging
+          echo "$API_RESPONSE" > api_response.json
+
+          # Extract the text content from the JSON response
+          REVIEW_TEXT=$(echo "$API_RESPONSE" | jq -r '.candidates[0].content.parts[0].text')
+
+          # If the review text is empty or null, provide a default message
+          if [ -z "$REVIEW_TEXT" ] || [ "$REVIEW_TEXT" == "null" ]; then
+            REVIEW_TEXT="Gemini API did not return a review. This might be due to an API error or a large, unreviewable diff."
+          fi
+
+          # Store the final review comment in a file to be used in the next step
+          echo "$REVIEW_TEXT" > review_comment.md
+
+      # Step 4: DEBUGGING STEP - Safely display API response
+      - name: Debug API Response
+        run: |
+          echo "--- RAW API RESPONSE ---"
+          cat api_response.json
+          echo ""
+          echo "------------------------"
+
+      # Step 5: Post the review as a comment on the Pull Request
+      - name: Post Review Comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Use the GitHub CLI to post the contents of our review file as a PR comment
+          gh pr comment $PR_NUMBER --body-file review_comment.md
