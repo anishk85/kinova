@@ -2,10 +2,8 @@
 
 import rospy
 import logging
-import os
-import json
 import numpy as np
-import torch  # Add this import
+import torch
 from std_msgs.msg import String
 from geometry_msgs.msg import Pose, PoseStamped, PointStamped
 from sensor_msgs.msg import Image, CameraInfo, JointState
@@ -32,19 +30,24 @@ class RoboticTypingController:
 
         self.robot_namespace = "my_gen3"  
         self.base_frame = 'base_link'
-        self.camera_frame = None  # Will auto-detect below
+        self.camera_frame = 'camera_link'
 
         self.depth_topic = '/camera/depth/image_rect_raw'
         self.color_topic = '/camera/color/image_raw'
         self.camera_info_topic = '/camera/color/camera_info'
 
-        self.press_depth = 0.002  # 2mm press
-        self.dwell_time = 0.2
-        self.approach_height = 0.01  # 1cm above key
-        self.safe_height = 0.05
+        # More conservative movement parameters to avoid acceleration limits
+        self.press_depth = 0.015  # Reduced from 0.03 to 1.5cm
+        self.dwell_time = 0.3
+        self.approach_height = 0.02  # Increased to 2cm above key
+        self.safe_height = 0.005
 
         self.bridge = CvBridge()
-        self.keypoints_3d = {}
+        
+        # In-memory coordinate storage (no file saving)
+        self.keypoints_3d = {}  # Current detected coordinates
+        self.session_coordinates = {}  # Accumulated coordinates during session
+        
         self.typing_active = False
         self.keyboard_detected = False
         self.depth_image = None
@@ -59,9 +62,6 @@ class RoboticTypingController:
         rospy.sleep(1.0)
         self.camera_frame = self.detect_camera_frame()
         rospy.loginfo(f"Using camera frame: {self.camera_frame}")
-
-        # Initialize coordinate saving system BEFORE other setup
-        self.setup_coordinate_saving()
 
         self.setup_vision()
         self.load_keyboard_layout()
@@ -92,154 +92,13 @@ class RoboticTypingController:
         rospy.logwarn("❌ No working camera frame found, using 'camera_link' as fallback")
         return 'camera_link'
 
-    def setup_coordinate_saving(self):
-        """Initialize coordinate saving system"""
-        try:
-            # Create coordinates directory if it doesn't exist
-            self.coordinates_dir = os.path.expanduser("~/keyboard_coordinates")
-            if not os.path.exists(self.coordinates_dir):
-                os.makedirs(self.coordinates_dir)
-                rospy.loginfo(f"📁 Created coordinates directory: {self.coordinates_dir}")
-            
-            # File paths
-            self.saved_coordinates_file = os.path.join(self.coordinates_dir, "saved_key_coordinates.json")
-            self.backup_coordinates_file = os.path.join(self.coordinates_dir, "backup_key_coordinates.json")
-            
-            # Load existing coordinates if available
-            self.saved_keypoints_3d = self.load_saved_coordinates()
-            
-            # Coordinate saving mode
-            self.coordinate_saving_mode = False
-            
-            rospy.loginfo("✅ Coordinate saving system initialized")
-            rospy.loginfo(f"📂 Coordinates will be saved to: {self.saved_coordinates_file}")
-            
-        except Exception as e:
-            rospy.logerr(f"Coordinate saving setup error: {e}")
-            self.saved_keypoints_3d = {}
-
-    def load_saved_coordinates(self):
-        """Load previously saved key coordinates"""
-        try:
-            if os.path.exists(self.saved_coordinates_file):
-                with open(self.saved_coordinates_file, 'r') as f:
-                    data = json.load(f)
-                    
-                saved_coords = data.get('keypoints_3d', {})
-                metadata = data.get('metadata', {})
-                
-                rospy.loginfo(f"📖 Loaded {len(saved_coords)} saved key coordinates")
-                rospy.loginfo(f"💾 Last saved: {metadata.get('timestamp', 'Unknown')}")
-                rospy.loginfo(f"🔑 Available saved keys: {list(saved_coords.keys())}")
-                
-                return saved_coords
-            else:
-                rospy.loginfo("📝 No saved coordinates found, starting fresh")
-                return {}
-                
-        except Exception as e:
-            rospy.logerr(f"Error loading saved coordinates: {e}")
-            return {}
-
-    def save_coordinates(self, coordinates_to_save=None):
-        """Save current key coordinates with good depth data"""
-        try:
-            if coordinates_to_save is None:
-                coordinates_to_save = self.keypoints_3d.copy()
-            
-            # Filter only keys with good depth data (marked green in visualization)
-            good_depth_keys = {}
-            for key, data in coordinates_to_save.items():
-                if isinstance(data, dict) and 'position' in data and 'depth' in data:
-                    # Check if depth is reasonable (between 0.1m and 2.0m)
-                    if 0.1 < data['depth'] < 2.0:
-                        good_depth_keys[key] = data
-            
-            if not good_depth_keys:
-                rospy.logwarn("⚠️ No keys with good depth data found to save")
-                return False
-            
-            # Create backup of existing file
-            if os.path.exists(self.saved_coordinates_file):
-                import shutil
-                shutil.copy2(self.saved_coordinates_file, self.backup_coordinates_file)
-                rospy.loginfo("💾 Created backup of existing coordinates")
-            
-            # Merge with existing coordinates
-            merged_coordinates = self.saved_keypoints_3d.copy()
-            merged_coordinates.update(good_depth_keys)
-            
-            # Prepare data to save
-            save_data = {
-                'metadata': {
-                    'timestamp': datetime.now().isoformat(),
-                    'total_keys': len(merged_coordinates),
-                    'newly_added': len(good_depth_keys),
-                    'camera_frame': self.camera_frame,
-                    'base_frame': self.base_frame,
-                    'robot_namespace': self.robot_namespace
-                },
-                'keypoints_3d': merged_coordinates
-            }
-            
-            # Save to file
-            with open(self.saved_coordinates_file, 'w') as f:
-                json.dump(save_data, f, indent=2)
-            
-            # Update internal saved coordinates
-            self.saved_keypoints_3d = merged_coordinates
-            
-            rospy.loginfo("✅ Successfully saved key coordinates!")
-            rospy.loginfo(f"💾 Saved {len(good_depth_keys)} keys with good depth data")
-            rospy.loginfo(f"🔑 Keys saved: {list(good_depth_keys.keys())}")
-            rospy.loginfo(f"📊 Total saved keys: {len(merged_coordinates)}")
-            
-            return True
-            
-        except Exception as e:
-            rospy.logerr(f"Error saving coordinates: {e}")
-            return False
-
-    def merge_coordinates_with_saved(self):
-        """Merge current detected coordinates with saved coordinates"""
-        try:
-            merged_coordinates = {}
-            
-            # Start with saved coordinates
-            merged_coordinates.update(self.saved_keypoints_3d)
-            
-            # Override with freshly detected coordinates (these are more current)
-            for key, data in self.keypoints_3d.items():
-                if isinstance(data, dict) and 'depth' in data:
-                    # Only use if depth is reasonable
-                    if 0.1 < data['depth'] < 2.0:
-                        merged_coordinates[key] = data
-                        rospy.logdebug(f"🔄 Using fresh coordinates for '{key}'")
-                    elif key in self.saved_keypoints_3d:
-                        rospy.logdebug(f"💾 Using saved coordinates for '{key}' (poor fresh depth)")
-                elif key in self.saved_keypoints_3d:
-                    rospy.logdebug(f"💾 Using saved coordinates for '{key}' (no fresh detection)")
-            
-            # Update keypoints for typing
-            original_count = len(self.keypoints_3d)
-            self.keypoints_3d = merged_coordinates
-            new_count = len(self.keypoints_3d)
-            
-            if new_count > original_count:
-                rospy.loginfo(f"🔄 Merged coordinates: {original_count} -> {new_count} keys available")
-                
-            return merged_coordinates
-            
-        except Exception as e:
-            rospy.logerr(f"Error merging coordinates: {e}")
-            return self.keypoints_3d
-
     def setup_vision(self):
         """Setup YOLO key detection model"""
         try:
             rospy.loginfo("🔧 Setting up YOLO key detection...")
             
             # Use the new best.pt model for key detection
+            import os
             current_dir = os.path.dirname(os.path.abspath(__file__))
             self.model_path = os.path.join(current_dir, '../src/best.pt')
             
@@ -289,16 +148,13 @@ class RoboticTypingController:
         """Initialize key detection - no layout file needed"""
         try:
             rospy.loginfo("🔧 Initializing key detection system...")
-            
             self.detected_keys = {}
-            
             rospy.loginfo("✅ Key detection system ready")
-                
         except Exception as e:
             rospy.logerr(f"Error initializing key detection: {e}")
 
     def setup_moveit(self):
-        """Initialize MoveIt components"""
+        """Initialize MoveIt components with better trajectory parameters"""
         try:
             rospy.loginfo("🔧 Setting up MoveIt...")
             
@@ -323,12 +179,12 @@ class RoboticTypingController:
                 ns=self.robot_namespace
             )
             
-            # Configure MoveIt for precise typing
+            # Configure MoveIt for precise typing with conservative parameters
             self.configure_moveit_for_typing()
 
-            # Set velocity and acceleration scaling for safer typing
-            self.move_group.set_max_velocity_scaling_factor(0.1)  # 10% max speed
-            self.move_group.set_max_acceleration_scaling_factor(0.1)  # 10% max acceleration
+            # Much more conservative velocity and acceleration for typing
+            self.move_group.set_max_velocity_scaling_factor(0.05)  # 5% max speed (was 10%)
+            self.move_group.set_max_acceleration_scaling_factor(0.05)  # 5% max acceleration (was 10%)
             
             rospy.loginfo("✅ MoveIt setup complete.")
             rospy.loginfo(f"   Planning Group: arm")
@@ -340,13 +196,13 @@ class RoboticTypingController:
             raise
 
     def configure_moveit_for_typing(self):
-        """Configure MoveIt parameters for precise typing"""
-        self.move_group.set_planning_time(10.0)
-        self.move_group.set_num_planning_attempts(10)
+        """Configure MoveIt parameters for precise typing with conservative settings"""
+        self.move_group.set_planning_time(15.0)  # Increased planning time
+        self.move_group.set_num_planning_attempts(15)  # More planning attempts
         self.move_group.allow_replanning(True)
         
-        self.move_group.set_goal_position_tolerance(0.002)  
-        self.move_group.set_goal_orientation_tolerance(0.1)  
+        self.move_group.set_goal_position_tolerance(0.005)  # Relaxed tolerance (was 0.002)
+        self.move_group.set_goal_orientation_tolerance(0.2)  # Relaxed orientation tolerance
         
         self.move_group.set_planner_id("RRTConnect")
 
@@ -357,38 +213,9 @@ class RoboticTypingController:
         rospy.Subscriber(f"/{self.robot_namespace}/joint_states", JointState, self.joint_state_callback)
         rospy.Subscriber("/type_text", String, self.type_text_callback)
         
-        # Add new subscribers for coordinate saving
-        rospy.Subscriber("/save_coordinates", String, self.save_coordinates_callback)
-        rospy.Subscriber("/toggle_coordinate_saving", String, self.toggle_coordinate_saving_callback)
-        
         self.typing_status_pub = rospy.Publisher("/typing_status", String, queue_size=10)
         self.key_coordinates_pub = rospy.Publisher("/key_coordinates_3d", String, queue_size=10)
         self.annotated_image_pub = rospy.Publisher("/annotated_keyboard", Image, queue_size=10)
-        self.trajectory_pub = rospy.Publisher(
-            f"/{self.robot_namespace}/move_group/display_planned_path", 
-            DisplayTrajectory, queue_size=10
-        )
-        
-        # Add publisher for coordinate saving status
-        self.coordinate_status_pub = rospy.Publisher("/coordinate_saving_status", String, queue_size=10)
-
-    def save_coordinates_callback(self, msg):
-        """Callback to save current coordinates"""
-        rospy.loginfo("💾 Manual coordinate saving requested...")
-        success = self.save_coordinates()
-        
-        status_msg = "✅ Coordinates saved successfully!" if success else "❌ Failed to save coordinates"
-        self.coordinate_status_pub.publish(String(data=status_msg))
-
-    def toggle_coordinate_saving_callback(self, msg):
-        """Toggle coordinate saving mode"""
-        self.coordinate_saving_mode = not self.coordinate_saving_mode
-        status = "ON" if self.coordinate_saving_mode else "OFF"
-        
-        rospy.loginfo(f"🔄 Coordinate saving mode: {status}")
-        self.coordinate_status_pub.publish(
-            String(data=f"Coordinate saving mode: {status}")
-        )
 
     def depth_callback(self, msg):
         try:
@@ -435,11 +262,6 @@ class RoboticTypingController:
                 time_since_detection = (rospy.Time.now() - self.last_detection_time).to_sec()
                 if time_since_detection > self.detection_timeout:
                     self.keyboard_detected = False
-                    
-                # Still merge with saved coordinates even if no new detection
-                if self.saved_keypoints_3d:
-                    self.merge_coordinates_with_saved()
-                    
                 return
 
             # Calculate 3D positions for detected keys
@@ -447,10 +269,6 @@ class RoboticTypingController:
             
             if not keypoints_3d_camera:
                 rospy.logwarn_throttle(5, "No 3D positions calculated - check depth image")
-                
-                # Still merge with saved coordinates
-                if self.saved_keypoints_3d:
-                    self.merge_coordinates_with_saved()
                 return
 
             # Transform to base frame and validate workspace
@@ -466,7 +284,9 @@ class RoboticTypingController:
                         'source': 'live_detection'
                     }
                     
-                    # Print coordinates for debugging
+                    # Store in session coordinates (accumulating during session)
+                    self.session_coordinates[key] = keypoints_3d_base[key].copy()
+                    
                     rospy.loginfo_throttle(5, 
                         f"🎯 Key '{key}': "
                         f"Pixel({keypoints_2d[key][0]}, {keypoints_2d[key][1]}) -> "
@@ -479,34 +299,13 @@ class RoboticTypingController:
                 self.keypoints_3d = keypoints_3d_base
                 self.keyboard_detected = True
                 
-                # Merge with saved coordinates
-                merged_coordinates = self.merge_coordinates_with_saved()
-                
-                # Auto-save if in coordinate saving mode
-                if self.coordinate_saving_mode:
-                    rospy.loginfo_throttle(10, "💾 Auto-saving coordinates (saving mode active)")
-                    self.save_coordinates(keypoints_3d_base)
-                
-                # Publish key coordinates with detection info
-                detection_data = {
-                    "timestamp": rospy.Time.now().to_sec(),
-                    "detection_method": "YOLO_individual_keys",
-                    "total_keys_detected": len(keypoints_3d_base),
-                    "total_keys_available": len(merged_coordinates),
-                    "saved_keys_loaded": len(self.saved_keypoints_3d),
-                    "keys": merged_coordinates,
-                    "fresh_detections": keypoints_3d_base
-                }
-                
-                self.key_coordinates_pub.publish(String(data=json.dumps(detection_data)))
-                
-                rospy.loginfo_throttle(10, f"✅ Fresh: {len(keypoints_3d_base)} keys | Total available: {len(merged_coordinates)} keys")
+                rospy.loginfo_throttle(10, f"✅ Fresh: {len(keypoints_3d_base)} keys | Session total: {len(self.session_coordinates)} keys")
                 
                 # Print summary of available keys
                 fresh_keys = list(keypoints_3d_base.keys())
-                all_keys = list(merged_coordinates.keys())
+                all_session_keys = list(self.session_coordinates.keys())
                 rospy.loginfo_throttle(15, f"🆕 Fresh keys: {sorted(fresh_keys)}")
-                rospy.loginfo_throttle(15, f"📋 All available keys: {sorted(all_keys)}")
+                rospy.loginfo_throttle(15, f"📋 Session keys: {sorted(all_session_keys)}")
 
         except Exception as e:
             rospy.logerr(f"Key detection processing error: {e}")
@@ -591,12 +390,10 @@ class RoboticTypingController:
                             if key_name and confidence > self.detection_confidence:
                                 keypoints_2d[key_name] = [center_x, center_y]
                                 detected_keys_list.append(f"{key_name}({confidence:.2f})")
-                                
-                                rospy.logdebug(f"Detected key '{key_name}' at ({center_x}, {center_y}) confidence: {confidence:.2f}")
                         
                         # Print detected keys periodically
-                        if detected_keys_list:
-                            rospy.loginfo_throttle(2, f"🔍 Detected keys: {detected_keys_list}")
+                        # if detected_keys_list:
+                            # rospy.loginfo_throttle(2, f"🔍 Detected keys: {detected_keys_list}")
                         
                         # Calculate overall keyboard region
                         if keypoints_2d:
@@ -662,7 +459,9 @@ class RoboticTypingController:
         return key_upper
 
     def calculate_3d_positions(self, keypoints_2d):
+        """Enhanced 3D position calculation with depth filtering"""
         keypoints_3d = {}
+        
         if self.camera_info is None or self.depth_image is None:
             return keypoints_3d
 
@@ -674,21 +473,32 @@ class RoboticTypingController:
         for key, (x, y) in keypoints_2d.items():
             try:
                 if 0 <= x < self.depth_image.shape[1] and 0 <= y < self.depth_image.shape[0]:
-                    # Median filter over 5x5 window
-                    window = self.depth_image[max(0, y-2):y+3, max(0, x-2):x+3]
-                    depth_vals = window.flatten()
-                    depth_vals = depth_vals[(depth_vals > 100) & (depth_vals < 2000)]  # 0.1m to 2.0m in mm
-                    if len(depth_vals) == 0:
-                        continue
-                    depth = np.median(depth_vals) / 1000.0  # meters
+                    # Multi-point depth sampling for robustness
+                    depth_samples = []
+                    for dx in range(-2, 3):
+                        for dy in range(-2, 3):
+                            px, py = x + dx, y + dy
+                            if (0 <= px < self.depth_image.shape[1] and
+                                0 <= py < self.depth_image.shape[0]):
+                                depth_val = self.depth_image[py, px] / 1000.0
+                                if 0.1 < depth_val < 2.0:
+                                    depth_samples.append(depth_val)
 
-                    if 0.1 < depth < 2.0:
+                    if depth_samples:
+                        # Use median depth for robustness
+                        depth = np.median(depth_samples)
+
+                        # Convert to 3D
                         X = (x - cx) * depth / fx
                         Y = (y - cy) * depth / fy
                         Z = depth
+
                         keypoints_3d[key] = [X, Y, Z]
+                        
+                        rospy.logdebug(f"Enhanced depth for {key}: {len(depth_samples)} samples, median: {depth:.3f}m")
+
             except Exception as e:
-                rospy.logwarn_throttle(10, f"3D position error for {key}: {e}")
+                rospy.logdebug(f"3D position error for {key}: {e}")
 
         return keypoints_3d
 
@@ -701,8 +511,6 @@ class RoboticTypingController:
             camera_point.point.y = point_camera[1]
             camera_point.point.z = point_camera[2]
 
-            rospy.loginfo(f"Transforming point {point_camera} from {self.camera_frame} to {self.base_frame}")
-
             transform = self.tf_buffer.lookup_transform(
                 self.base_frame, self.camera_frame,
                 rospy.Time(0), rospy.Duration(2.0)
@@ -711,8 +519,6 @@ class RoboticTypingController:
             base_point = do_transform_point(camera_point, transform)
             result = np.array([base_point.point.x, base_point.point.y, base_point.point.z])
 
-            rospy.loginfo(f"Transformed to base: {result}")
-
             return result
 
         except Exception as e:
@@ -720,12 +526,11 @@ class RoboticTypingController:
             return None
 
     def publish_annotated_image(self, keypoints_2d, keyboard_bbox):
-        """Enhanced detection visualization with coordinate saving info"""
+        """Enhanced detection visualization"""
         if self.color_image is None:
             return
             
         try:
-            # Enhanced annotation for debugging
             annotated = self.color_image.copy()
             
             # Draw keyboard bounding box if available
@@ -736,15 +541,11 @@ class RoboticTypingController:
                            (int(pts[0][0]), int(pts[0][1] - 10)), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
             
-            # Get merged coordinates for visualization
-            merged_coords = self.merge_coordinates_with_saved() if hasattr(self, 'saved_keypoints_3d') else self.keypoints_3d
-            
-            # Draw detected keys with enhanced visualization
+            # Draw detected keys
             for key, (x, y) in keypoints_2d.items():
                 # Color coding: 
                 # Green = fresh detection with good depth
-                # Blue = fresh detection but poor depth
-                # Yellow = using saved coordinates
+                # Yellow = session coordinates available
                 # Red = no 3D data available
                 
                 if key in self.keypoints_3d:
@@ -760,66 +561,36 @@ class RoboticTypingController:
                     else:
                         color = (0, 0, 255)  # Red - no depth info
                         status = "FRESH+NO_DEPTH"
-                elif key in self.saved_keypoints_3d:
-                    color = (0, 255, 255)  # Yellow - using saved coordinates
-                    status = "SAVED"
+                elif key in self.session_coordinates:
+                    color = (0, 255, 255)  # Yellow - session coordinates available
+                    status = "SESSION"
                 else:
                     color = (0, 0, 255)  # Red - no 3D data
                     status = "NO_3D"
                 
-                # Draw key center with larger circle
+                # Draw key center
                 cv2.circle(annotated, (int(x), int(y)), 10, color, -1)
                 cv2.circle(annotated, (int(x), int(y)), 12, (255, 255, 255), 2)
                 
-                # Draw key label with background and status
-                font_scale = 0.5
-                thickness = 2
+                # Draw key label
                 label = f"{key} ({status})"
-                text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
-                
-                # Background rectangle for text
-                cv2.rectangle(annotated, 
-                             (int(x) - text_size[0]//2 - 3, int(y) - text_size[1] - 20),
-                             (int(x) + text_size[0]//2 + 3, int(y) - 5),
-                             (0, 0, 0), -1)
-                
-                # Text
                 cv2.putText(annotated, label, 
-                           (int(x) - text_size[0]//2, int(y) - 8), 
-                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+                           (int(x) - 30, int(y) - 15), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             
-            # Enhanced status information
+            # Status information
             status_lines = [
                 f"YOLO Model: {'Active' if self.use_yolo else 'Inactive'}",
                 f"2D Keys Detected: {len(keypoints_2d)}",
                 f"3D Keys (Fresh): {len(self.keypoints_3d)}",
-                f"3D Keys (Saved): {len(self.saved_keypoints_3d)}",
-                f"Total Available: {len(merged_coords)}",
-                f"Coordinate Saving: {'ON' if self.coordinate_saving_mode else 'OFF'}",
+                f"Session Total: {len(self.session_coordinates)}",
                 f"Transform Frame: {self.camera_frame}"
             ]
             
             for i, line in enumerate(status_lines):
                 y_pos = 30 + i * 25
-                # Background for text
-                text_size = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                cv2.rectangle(annotated, (5, y_pos - 20), (text_size[0] + 10, y_pos + 5), (0, 0, 0), -1)
                 cv2.putText(annotated, line, (10, y_pos), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            
-            # Add legend for colors
-            legend_y_start = annotated.shape[0] - 120
-            legend_items = [
-                ("GREEN: Fresh + Good Depth", (0, 255, 0)),
-                ("YELLOW: Using Saved Coords", (0, 255, 255)),
-                ("RED: Poor/No Depth", (0, 0, 255))
-            ]
-            
-            for i, (text, color) in enumerate(legend_items):
-                y_pos = legend_y_start + i * 25
-                cv2.rectangle(annotated, (10, y_pos - 15), (30, y_pos + 5), color, -1)
-                cv2.putText(annotated, text, (40, y_pos), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             
             # Publish debug image
             msg = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
@@ -848,11 +619,12 @@ class RoboticTypingController:
         self.publish_status(f"Starting to type: '{text}'")
 
         try:
-            # Use merged coordinates (fresh + saved)
-            available_coords = self.merge_coordinates_with_saved()
+            # Use all available coordinates (fresh + session)
+            available_coords = self.session_coordinates.copy()
+            available_coords.update(self.keypoints_3d)  # Fresh coords override session coords
             
             if not available_coords:
-                self.publish_status("❌ No keyboard coordinates available (neither detected nor saved)")
+                self.publish_status("❌ No keyboard coordinates available")
                 return
 
             success_count = 0
@@ -867,10 +639,10 @@ class RoboticTypingController:
                 key_name = self.char_to_key(char)
                 
                 if key_name and key_name in available_coords:
-                    source = "fresh detection" if key_name in self.keypoints_3d else "saved coordinates"
+                    source = "fresh detection" if key_name in self.keypoints_3d else "session coordinates"
                     rospy.loginfo(f"🎯 Using {source} for key '{key_name}'")
                     
-                    if self.type_key(key_name):
+                    if self.type_key(key_name, available_coords):
                         success_count += 1
                         rospy.loginfo(f"✅ Typed '{char}' using {source}")
                     else:
@@ -879,7 +651,7 @@ class RoboticTypingController:
                     rospy.logwarn(f"⚠️ Key '{key_name}' not available for '{char}'")
                     rospy.loginfo(f"📋 Available keys: {list(available_coords.keys())}")
                 
-                rospy.sleep(0.5)
+                rospy.sleep(0.8)  # Longer delay between keystrokes
 
             self.publish_status(f"✅ Typing complete: {success_count}/{total_chars}")
 
@@ -901,10 +673,7 @@ class RoboticTypingController:
         else:
             return char.upper()
 
-    def type_key(self, key_name):
-        # Use merged coordinates
-        available_coords = self.merge_coordinates_with_saved()
-        
+    def type_key(self, key_name, available_coords):
         if key_name not in available_coords:
             return False
 
@@ -912,13 +681,12 @@ class RoboticTypingController:
             target_pos = available_coords[key_name]['position']
             rospy.loginfo(f"⌨️ Typing key '{key_name}' at {target_pos}")
 
-            if self.type_key_cartesian(key_name, target_pos):
+            # Try improved Cartesian approach first
+            if self.type_key_improved_cartesian(key_name, target_pos):
                 return True
 
+            # Fallback to joint space approach
             if self.type_key_joint_space(key_name, target_pos):
-                return True
-
-            if self.type_key_simple_pose(key_name, target_pos):
                 return True
 
             rospy.logwarn(f"All typing methods failed for key '{key_name}'")
@@ -927,80 +695,173 @@ class RoboticTypingController:
         except Exception as e:
             rospy.logerr(f"Key typing error for '{key_name}': {e}")
             return False
-            
-    def type_key_cartesian(self, key_name, target_pos):
+
+    def type_key_improved_cartesian(self, key_name, target_pos):
+        """
+        MODIFIED Cartesian approach with a horizontal press motion.
+        """
         try:
-            rospy.loginfo(f"🎯 Cartesian approach for '{key_name}'")
+            rospy.loginfo(f"🎯 Horizontal Cartesian approach for '{key_name}'")
             current_pose = self.move_group.get_current_pose().pose
 
-            # Log all relevant info
-            rospy.loginfo(f"Current EE pose: x={current_pose.position.x:.4f}, y={current_pose.position.y:.4f}, z={current_pose.position.z:.4f}")
-            rospy.loginfo(f"Target key '{key_name}' position: {target_pos} (should be in {self.base_frame})")
-            rospy.loginfo(f"Planning frame: {self.move_group.get_planning_frame()}")
-            rospy.loginfo(f"End effector link: {self.move_group.get_end_effector_link()}")
+            # --- Define Horizontal Motion Parameters ---
+            # How far in front of the key to start the motion (in meters)
+            horizontal_offset = 0.05  # 5 cm
+            # How high above the key surface to move (in meters)
+            vertical_clearance = 0.01 # 1 cm
+            x_press_offset = 0.07
 
             waypoints = []
 
-            # Approach above key
-            approach_pose = Pose()
-            approach_pose.position.x = target_pos[0]
-            approach_pose.position.y = target_pos[1]
-            approach_pose.position.z = target_pos[2] + self.approach_height
-            approach_pose.orientation = current_pose.orientation
-            waypoints.append(approach_pose)
+            # 1. Move to a safe point: IN FRONT of and ABOVE the key
+            safe_pose = Pose()
+            safe_pose.position.x = target_pos[0] - horizontal_offset # Move back along X-axis
+            safe_pose.position.y = target_pos[1]
+            safe_pose.position.z = target_pos[2] + vertical_clearance # Move up
+            safe_pose.orientation = current_pose.orientation
+            waypoints.append(safe_pose)
 
-            # Press key
+            # 2. Move to pre-press position: IN FRONT of the key, at the correct height
+            pre_press_pose = Pose()
+            pre_press_pose.position.x = target_pos[0]  # Still back along X
+            pre_press_pose.position.y = target_pos[1]
+            pre_press_pose.position.z = target_pos[2] # At target height
+            pre_press_pose.orientation = current_pose.orientation
+            waypoints.append(pre_press_pose)
+
+            # 3. Press the key: Move FORWARD horizontally
             press_pose = Pose()
-            press_pose.position.x = target_pos[0]
+            press_pose.position.x = target_pos[0] + x_press_offset # Move to target X
             press_pose.position.y = target_pos[1]
-            press_pose.position.z = target_pos[2] - self.press_depth
+            press_pose.position.z = target_pos[2]
             press_pose.orientation = current_pose.orientation
             waypoints.append(press_pose)
 
-            # Retract
-            retract_pose = Pose()
-            retract_pose.position.x = target_pos[0]
-            retract_pose.position.y = target_pos[1]
-            retract_pose.position.z = target_pos[2] + self.approach_height
-            retract_pose.orientation = current_pose.orientation
-            waypoints.append(retract_pose)
+            # 4. Release: Move BACK horizontally to the pre-press position
+            waypoints.append(pre_press_pose)
+            
+            # 5. Retract: Move back to the safe position
+            waypoints.append(safe_pose)
 
-            rospy.loginfo("Computing Cartesian path...")
+            rospy.loginfo("Computing horizontal Cartesian path...")
             (plan, fraction) = self.move_group.compute_cartesian_path(
                 waypoints,
-                eef_step=0.005,  # 5mm steps for more accuracy
+                eef_step=0.002,
+                 # Disable jump threshold
             )
 
             rospy.loginfo(f"Cartesian path: {fraction*100:.1f}% complete")
 
-            if fraction > 0.8:
-                rospy.loginfo("Executing Cartesian trajectory...")
+            if fraction > 0.7:
+                if hasattr(plan, 'joint_trajectory'):
+                    self.scale_trajectory_timing(plan.joint_trajectory)
+                
+                rospy.loginfo("Executing horizontal Cartesian trajectory...")
                 success = self.move_group.execute(plan, wait=True)
+                
                 if success:
-                    rospy.loginfo(f"✅ Cartesian typing successful for '{key_name}'")
-                    rospy.sleep(self.dwell_time)
+                    rospy.loginfo(f"✅ Horizontal Cartesian typing successful for '{key_name}'")
+                    # Dwell time is effectively handled by the motion itself, but a small sleep can help
+                    rospy.sleep(0.1) 
                     self.move_group.stop()
                     return True
                 else:
-                    rospy.logwarn("Cartesian execution failed")
+                    rospy.logwarn("Horizontal Cartesian execution failed")
             else:
-                rospy.logwarn(f"Cartesian path only {fraction*100:.1f}% valid")
+                rospy.logwarn(f"Horizontal Cartesian path only {fraction*100:.1f}% valid, trying step-by-step")
+                if self.execute_waypoints_stepwise(waypoints):
+                    return True
 
         except Exception as e:
-            rospy.logerr(f"Cartesian typing error: {e}")
-
+            rospy.logerr(f"Horizontal Cartesian typing error: {e}")
         finally:
             self.move_group.stop()
             self.move_group.clear_pose_targets()
 
         return False
+    def scale_trajectory_timing(self, joint_trajectory):
+        """Scale trajectory timing to reduce velocities and accelerations"""
+        try:
+            # Scale time stamps to make movement slower
+            time_scale_factor = 3.0  # Make 3x slower
+            
+            for i, point in enumerate(joint_trajectory.points):
+                if i == 0:
+                    continue  # Skip first point
+                
+                # Scale time
+                point.time_from_start = rospy.Duration(
+                    point.time_from_start.to_sec() * time_scale_factor
+                )
+                
+                # Reduce velocities
+                if point.velocities:
+                    point.velocities = [v / time_scale_factor for v in point.velocities]
+                
+                # Reduce accelerations  
+                if point.accelerations:
+                    point.accelerations = [a / (time_scale_factor * time_scale_factor) for a in point.accelerations]
+                    
+        except Exception as e:
+            rospy.logerr(f"Trajectory scaling error: {e}")
+
+    def execute_waypoints_stepwise(self, waypoints):
+        """Execute waypoints one by one instead of as a single trajectory"""
+        try:
+            rospy.loginfo("Executing waypoints step-by-step...")
+            
+            for i, waypoint in enumerate(waypoints):
+                rospy.loginfo(f"Moving to waypoint {i+1}/{len(waypoints)}")
+                
+                self.move_group.set_pose_target(waypoint)
+                self.move_group.set_planning_time(10.0)
+                
+                plan = self.move_group.plan()
+                
+                if plan[0]:  # If planning succeeded
+                    success = self.move_group.execute(plan[1], wait=True)
+                    if success:
+                        rospy.loginfo(f"✅ Reached waypoint {i+1}")
+                        
+                        # Add dwell time for press waypoint
+                        if i == 2:  # Press waypoint (0-indexed)
+                            rospy.sleep(self.dwell_time)
+                    else:
+                        rospy.logwarn(f"❌ Failed to reach waypoint {i+1}")
+                        return False
+                else:
+                    rospy.logwarn(f"❌ Planning failed for waypoint {i+1}")
+                    return False
+                
+                rospy.sleep(0.2)  # Small delay between waypoints
+            
+            rospy.loginfo("✅ Step-by-step execution completed")
+            return True
+            
+        except Exception as e:
+            rospy.logerr(f"Step-by-step execution error: {e}")
+            return False
+            
+        finally:
+            self.move_group.stop()
+            self.move_group.clear_pose_targets()
 
     def type_key_joint_space(self, key_name, target_pos):
+        """Joint space typing with better error handling and faster movement"""
         try:
             rospy.loginfo(f"🔧 Joint space approach for '{key_name}'")
             
             current_pose = self.move_group.get_current_pose().pose
             
+            # Temporarily increase velocity for joint space movements
+            original_vel_scaling = self.move_group.get_max_velocity_scaling_factor()
+            original_acc_scaling = self.move_group.get_max_acceleration_scaling_factor()
+            
+            # Set faster movement for joint space (but still conservative)
+            self.move_group.set_max_velocity_scaling_factor(0.15)  # Increased from 0.05 to 0.15
+            self.move_group.set_max_acceleration_scaling_factor(0.15)  # Increased from 0.05 to 0.15
+            
+            # Approach position
             approach_pose = Pose()
             approach_pose.position.x = target_pos[0]
             approach_pose.position.y = target_pos[1]
@@ -1008,6 +869,7 @@ class RoboticTypingController:
             approach_pose.orientation = current_pose.orientation
             
             self.move_group.set_pose_target(approach_pose)
+            self.move_group.set_planning_time(10.0)  # Reduced from 15.0
             
             rospy.loginfo("Planning approach movement...")
             approach_plan = self.move_group.plan()
@@ -1016,6 +878,10 @@ class RoboticTypingController:
                 rospy.loginfo("Executing approach...")
                 if self.move_group.execute(approach_plan[1], wait=True):
                     rospy.loginfo("✅ Reached approach position")
+                    
+                    # Press position - use slower movement for precision
+                    self.move_group.set_max_velocity_scaling_factor(0.15)  # Slower for press
+                    self.move_group.set_max_acceleration_scaling_factor(0.15)
                     
                     press_pose = Pose()
                     press_pose.position.x = target_pos[0]
@@ -1032,6 +898,10 @@ class RoboticTypingController:
                             rospy.loginfo(f"✅ Pressed key '{key_name}'")
                             rospy.sleep(self.dwell_time)
                             
+                            # Retract - faster movement again
+                            self.move_group.set_max_velocity_scaling_factor(0.05)
+                            self.move_group.set_max_acceleration_scaling_factor(0.05)
+                            
                             self.move_group.set_pose_target(approach_pose)
                             retract_plan = self.move_group.plan()
                             
@@ -1039,8 +909,6 @@ class RoboticTypingController:
                                 self.move_group.execute(retract_plan[1], wait=True)
                                 rospy.loginfo("✅ Retracted from key")
                             
-                            self.move_group.stop()
-                            self.move_group.clear_pose_targets()
                             return True
                     else:
                         rospy.logwarn("Press movement planning failed")
@@ -1053,45 +921,20 @@ class RoboticTypingController:
             rospy.logerr(f"Joint space typing error: {e}")
             
         finally:
+            # Restore original velocity scaling
+            try:
+                self.move_group.set_max_velocity_scaling_factor(original_vel_scaling)
+                self.move_group.set_max_acceleration_scaling_factor(original_acc_scaling)
+            except:
+                # Fallback to default conservative values
+                self.move_group.set_max_velocity_scaling_factor(0.05)
+                self.move_group.set_max_acceleration_scaling_factor(0.05)
+                
             self.move_group.stop()
             self.move_group.clear_pose_targets()
             
         return False
 
-    def type_key_simple_pose(self, key_name, target_pos):
-        try:
-            rospy.loginfo(f"🎯 Simple pose approach for '{key_name}'")
-            
-            current_pose = self.move_group.get_current_pose().pose
-            
-            target_pose = Pose()
-            target_pose.position.x = target_pos[0]
-            target_pose.position.y = target_pos[1]
-            target_pose.position.z = target_pos[2] + 0.005  
-            target_pose.orientation = current_pose.orientation
-            
-            self.move_group.set_pose_target(target_pose)
-            self.move_group.set_planning_time(5.0)
-            
-            plan = self.move_group.plan()
-            
-            if plan[0]:
-                success = self.move_group.execute(plan[1], wait=True)
-                if success:
-                    rospy.loginfo(f"✅ Simple pose typing for '{key_name}'")
-                    rospy.sleep(self.dwell_time)
-                    self.move_group.stop()
-                    self.move_group.clear_pose_targets()
-                    return True
-            
-        except Exception as e:
-            rospy.logerr(f"Simple pose typing error: {e}")
-            
-        finally:
-            self.move_group.stop()
-            self.move_group.clear_pose_targets()
-            
-        return False
 
     def get_robot_status(self):
         try:
@@ -1099,8 +942,7 @@ class RoboticTypingController:
                 'timestamp': rospy.Time.now().to_sec(),
                 'keyboard_detected': self.keyboard_detected,
                 'num_keys_detected': len(self.keypoints_3d),
-                'num_saved_keys': len(self.saved_keypoints_3d),
-                'coordinate_saving_mode': self.coordinate_saving_mode,
+                'num_session_keys': len(self.session_coordinates),
                 'typing_active': self.typing_active,
                 'current_pose': None,
                 'joint_states': None
@@ -1148,17 +990,14 @@ class RoboticTypingController:
             self.move_group.stop()
             self.move_group.clear_pose_targets()
             
-            # Save coordinates one final time if we have fresh detections
-            if self.keypoints_3d:
-                rospy.loginfo("💾 Saving coordinates before shutdown...")
-                self.save_coordinates()
-            
             moveit_commander.roscpp_shutdown()
             
+            rospy.loginfo(f"✅ Session ended with {len(self.session_coordinates)} keys learned")
             rospy.loginfo("✅ Shutdown complete")
             
         except Exception as e:
             rospy.logerr(f"Shutdown error: {e}")
+
 
 def main():
     try:
@@ -1168,12 +1007,11 @@ def main():
         
         rospy.loginfo("🤖 Robotic Typing Controller is ready!")
         rospy.loginfo("📝 Send text to '/type_text' topic to start typing")
-        rospy.loginfo("💾 Send message to '/save_coordinates' to save current key positions")
-        rospy.loginfo("🔄 Send message to '/toggle_coordinate_saving' to toggle auto-save mode")
         rospy.loginfo("🎨 Watch '/annotated_keyboard' topic for visual feedback")
         rospy.loginfo("   - GREEN keys: Fresh detection with good depth")
-        rospy.loginfo("   - YELLOW keys: Using saved coordinates")
+        rospy.loginfo("   - YELLOW keys: Session coordinates available")
         rospy.loginfo("   - RED keys: Poor or no depth data")
+        rospy.loginfo("💾 Coordinates are stored in memory during this session only")
         
         rospy.spin()
         
@@ -1183,6 +1021,7 @@ def main():
         rospy.logfatal(f"❌ Fatal error: {e}")
     finally:
         rospy.loginfo("🔄 Exiting...")
+
 
 if __name__ == "__main__":
     main()
