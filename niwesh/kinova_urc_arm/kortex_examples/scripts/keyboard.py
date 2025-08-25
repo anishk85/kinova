@@ -18,6 +18,19 @@ import moveit_msgs.msg
 from moveit_msgs.msg import DisplayTrajectory, RobotTrajectory
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from datetime import datetime
+from moveit_msgs.msg import Constraints, PositionConstraint
+import shape_msgs.msg
+
+
+
+# Camera parameters
+color_info = {
+    'K': [1297.672904, 0.0, 620.914026, 0.0, 1298.631344, 238.280325, 0.0, 0.0, 1.0]
+}
+
+depth_info = {
+    'K': [360.01333, 0.0, 243.87228, 0.0, 360.013366699, 137.9218444, 0.0, 0.0, 1.0]
+}
 
 
 class RoboticTypingController:
@@ -30,7 +43,7 @@ class RoboticTypingController:
 
         self.robot_namespace = "my_gen3"  
         self.base_frame = 'base_link'
-        self.camera_frame = 'camera_link'
+        self.camera_frame = 'camera_depth_frame'
 
         self.depth_topic = '/camera/depth/image_rect_raw'
         self.color_topic = '/camera/color/image_raw'
@@ -60,37 +73,42 @@ class RoboticTypingController:
 
         # Wait for TF and auto-detect camera frame
         rospy.sleep(1.0)
-        self.camera_frame = self.detect_camera_frame()
+        # self.camera_frame = self.detect_camera_frame()
         rospy.loginfo(f"Using camera frame: {self.camera_frame}")
 
         self.setup_vision()
         self.load_keyboard_layout()
         self.setup_moveit()
         self.setup_subscribers_publishers()
+        self.workspace_bounds = {
+            'x_min': 0.2, 'x_max': 0.8,   # 20cm to 80cm forward
+            'y_min': -0.4, 'y_max': 0.4,  # ±40cm left/right  
+            'z_min': 0.1, 'z_max': 0.5    # 10cm to 50cm height
+        }
 
         rospy.loginfo("✅ Robotic Typing Controller initialized successfully!")
 
-    def detect_camera_frame(self):
-        """Automatically detect the correct camera frame for transforms."""
-        possible_frames = [
-            f'{self.robot_namespace}/camera_color_optical_frame',
-            f'{self.robot_namespace}/camera_link',
-            f'{self.robot_namespace}/camera_depth_optical_frame',
-            'camera_color_optical_frame',
-            'camera_link',
-            'camera_depth_optical_frame',
-            'camera_color_frame',
-            'camera_depth_frame'
-        ]
-        for frame in possible_frames:
-            try:
-                self.tf_buffer.lookup_transform(self.base_frame, frame, rospy.Time(0), rospy.Duration(1.0))
-                rospy.loginfo(f"✅ Found working camera frame: {frame}")
-                return frame
-            except Exception:
-                continue
-        rospy.logwarn("❌ No working camera frame found, using 'camera_link' as fallback")
-        return 'camera_link'
+    # def detect_camera_frame(self):
+    #     """Automatically detect the correct camera frame for transforms."""
+    #     possible_frames = [
+    #         f'{self.robot_namespace}/camera_color_optical_frame',
+    #         f'{self.robot_namespace}/camera_link',
+    #         f'{self.robot_namespace}/camera_depth_optical_frame',
+    #         'camera_color_optical_frame',
+    #         'camera_link',
+    #         'camera_depth_optical_frame',
+    #         'camera_color_frame',
+    #         'camera_depth_frame'
+    #     ]
+    #     for frame in possible_frames:
+    #         try:
+    #             self.tf_buffer.lookup_transform(self.base_frame, frame, rospy.Time(0), rospy.Duration(1.0))
+    #             rospy.loginfo(f"✅ Found working camera frame: {frame}")
+    #             return frame
+    #         except Exception:
+    #             continue
+    #     rospy.logwarn("❌ No working camera frame found, using 'camera_link' as fallback")
+    #     return 'camera_depth_frame'
 
     def setup_vision(self):
         """Setup YOLO key detection model"""
@@ -266,6 +284,8 @@ class RoboticTypingController:
 
             # Calculate 3D positions for detected keys
             keypoints_3d_camera = self.calculate_3d_positions(keypoints_2d)
+
+            
             
             if not keypoints_3d_camera:
                 rospy.logwarn_throttle(5, "No 3D positions calculated - check depth image")
@@ -458,48 +478,188 @@ class RoboticTypingController:
         rospy.logwarn_throttle(30, f"Unknown key detected: '{detected_class}' -> normalized to '{key_upper}'")
         return key_upper
 
-    def calculate_3d_positions(self, keypoints_2d):
-        """Enhanced 3D position calculation with depth filtering"""
-        keypoints_3d = {}
-        
-        if self.camera_info is None or self.depth_image is None:
-            return keypoints_3d
+    # def compute_3d_coordinates_from_uv(self, u, v, depth):
+    #     """Compute 3D coordinates from depth."""
+    #     if depth <= 0 or np.isnan(depth) or np.isinf(depth):
+    #         return None
 
+    #     K = np.array(depth_info['K']).reshape(3, 3)
+    #     uv1 = np.array([u, v, 1.0])
+    #     xyz = np.linalg.inv(K) @ uv1 * depth
+    #     return xyz[0], xyz[1], xyz[2]
+
+    # def depth_helper(self,x, y):
+    #     # Project RGB center to depth frame
+    #         u_depth = int(((x - color_info['K'][2]) *
+    #                         (depth_info['K'][0] / color_info['K'][0])) +
+    #                         depth_info['K'][2])
+    #         v_depth = int(((y - color_info['K'][5]) *
+    #                         (depth_info['K'][4] / color_info['K'][4])) +
+    #                         depth_info['K'][5])
+
+    #         world_coords = None
+
+    #         if 0 <= u_depth < depth_image.shape[1] and 0 <= v_depth < depth_image.shape[0]:
+    #             depth_value = depth_image[v_depth, u_depth]
+
+    #             if not np.isnan(depth_value) and not np.isinf(depth_value):
+    #                 camera_coords = self.compute_3d_coordinates_from_uv(u_depth, v_depth, depth_value)
+
+    #         return camera_coords
+
+    # def calculate_3d_positions(self, keypoints_2d):
+    #     """Enhanced 3D position calculation with depth filtering"""
+    #     keypoints_3d = {}
+        
+    #     if self.camera_info is None or self.depth_image is None:
+    #         return keypoints_3d
+
+    #     fx = self.camera_info.K[0]
+    #     fy = self.camera_info.K[4]
+    #     cx = self.camera_info.K[2]
+    #     cy = self.camera_info.K[5]
+
+    #     for key, (x, y) in keypoints_2d.items():
+    #         try:
+    #             if 0 <= x < self.depth_image.shape[1] and 0 <= y < self.depth_image.shape[0]:
+    #                 camera_coords = None
+    #                 camera_coords = self.depth_helper(x, y)
+
+    #                 if camera_coords:
+    #                     keypoints_3d[key] = [camera_coords[0], camera_coords[1], camera_coords[2]]
+
+    #                     # ---- Log in camera frame ----
+    #                     rospy.loginfo(f"[Camera] {key}: "
+    #                               f"X={camera_coords[0]:.3f}, "
+    #                               f"Y={camera_coords[1]:.3f}, "
+    #                               f"Z={camera_coords[2]:.3f}")
+
+    #                     world_coords = self.transform_to_base_frame(camera_coords)
+    #                     if world_coords:
+    #                         rospy.loginfo(f"[Base]   {key}: "
+    #                                   f"X={world_coords[0]:.3f}, "
+    #                                   f"Y={world_coords[1]:.3f}, "
+    #                                   f"Z={world_coords[2]:.3f}")
+
+    #                 else:
+    #                     rospy.logwarn(f"Transform to base frame failed for key: {key}")
+                        
+    #         except Exception as e:
+    #             rospy.logdebug(f"3D position error for {key}: {e}")
+
+    #     return keypoints_3d
+
+
+    def compute_3d_coordinates_from_uv(self, u, v, depth):
+        """Compute 3D coordinates from depth using actual camera info."""
+        if depth <= 0 or np.isnan(depth) or np.isinf(depth):
+            return None
+
+        # Use actual camera intrinsics instead of hardcoded values
         fx = self.camera_info.K[0]
         fy = self.camera_info.K[4]
         cx = self.camera_info.K[2]
         cy = self.camera_info.K[5]
+        
+        # Convert pixel coordinates to 3D camera coordinates
+        X = (u - cx) * depth / fx
+        Y = (v - cy) * depth / fy
+        Z = depth
+        
+        return X, Y, Z
+
+    def depth_helper(self, x, y):
+        """Get 3D coordinates with proper depth sampling and validation"""
+        try:
+            # For aligned depth and color images, coordinates should match directly
+            # If your depth and color are aligned, no projection needed
+            u_depth = int(x)
+            v_depth = int(y)
+            
+            # Validate bounds
+            if not (0 <= u_depth < self.depth_image.shape[1] and 0 <= v_depth < self.depth_image.shape[0]):
+                rospy.logdebug(f"Depth coordinates out of bounds: ({u_depth}, {v_depth})")
+                return None
+
+            # Enhanced multi-point depth sampling
+            depth_samples = []
+            sample_radius = 3  # Increased sample area
+            
+            for dx in range(-sample_radius, sample_radius + 1):
+                for dy in range(-sample_radius, sample_radius + 1):
+                    px, py = u_depth + dx, v_depth + dy
+                    if (0 <= px < self.depth_image.shape[1] and 
+                        0 <= py < self.depth_image.shape[0]):
+                        
+                        depth_val = self.depth_image[py, px]  # Keep in original units
+                        
+                        # Check if depth value is valid (adjust range as needed)
+                        if depth_val > 0 and not np.isnan(depth_val) and not np.isinf(depth_val):
+                            depth_m = depth_val / 1000.0  # Convert mm to meters
+                            if 0.1 < depth_m < 3.0:  # Valid depth range in meters
+                                depth_samples.append(depth_m)
+
+            if len(depth_samples) < 3:  # Need at least 3 valid samples
+                rospy.logdebug(f"Insufficient depth samples: {len(depth_samples)} for key at ({x}, {y})")
+                return None
+
+            # Use median depth for robustness
+            depth_value = np.median(depth_samples)
+            
+            rospy.logdebug(f"Depth sampling: {len(depth_samples)} samples, median: {depth_value:.3f}m")
+            
+            # Compute 3D coordinates
+            camera_coords = self.compute_3d_coordinates_from_uv(u_depth, v_depth, depth_value)
+            return camera_coords
+            
+        except Exception as e:
+            rospy.logdebug(f"Depth helper error: {e}")
+            return None
+
+    def calculate_3d_positions(self, keypoints_2d):
+        """Enhanced 3D position calculation with better validation"""
+        keypoints_3d = {}
+        
+        if self.camera_info is None:
+            rospy.logwarn("No camera info available for 3D calculation")
+            return keypoints_3d
+            
+        if self.depth_image is None:
+            rospy.logwarn("No depth image available for 3D calculation")
+            return keypoints_3d
+
+        rospy.loginfo(f"Computing 3D positions for {len(keypoints_2d)} keys")
+        rospy.loginfo(f"Depth image shape: {self.depth_image.shape}")
+        rospy.loginfo(f"Color image shape: {self.color_image.shape}")
 
         for key, (x, y) in keypoints_2d.items():
             try:
-                if 0 <= x < self.depth_image.shape[1] and 0 <= y < self.depth_image.shape[0]:
-                    # Multi-point depth sampling for robustness
-                    depth_samples = []
-                    for dx in range(-2, 3):
-                        for dy in range(-2, 3):
-                            px, py = x + dx, y + dy
-                            if (0 <= px < self.depth_image.shape[1] and
-                                0 <= py < self.depth_image.shape[0]):
-                                depth_val = self.depth_image[py, px] / 1000.0
-                                if 0.1 < depth_val < 2.0:
-                                    depth_samples.append(depth_val)
+                # Validate input coordinates
+                if not (0 <= x < self.color_image.shape[1] and 0 <= y < self.color_image.shape[0]):
+                    rospy.logwarn(f"Key '{key}' coordinates ({x}, {y}) out of color image bounds")
+                    continue
+                    
+                camera_coords = self.depth_helper(x, y)
 
-                    if depth_samples:
-                        # Use median depth for robustness
-                        depth = np.median(depth_samples)
+                if camera_coords is not None:
+                    keypoints_3d[key] = [camera_coords[0], camera_coords[1], camera_coords[2]]
 
-                        # Convert to 3D
-                        X = (x - cx) * depth / fx
-                        Y = (y - cy) * depth / fy
-                        Z = depth
-
-                        keypoints_3d[key] = [X, Y, Z]
-                        
-                        rospy.logdebug(f"Enhanced depth for {key}: {len(depth_samples)} samples, median: {depth:.3f}m")
-
+                    # Enhanced logging
+                    rospy.loginfo(f"✅ 3D calc for '{key}': "
+                                f"2D({x}, {y}) -> "
+                                f"3D({camera_coords[0]:.3f}, {camera_coords[1]:.3f}, {camera_coords[2]:.3f})")
+                # else:
+                    # rospy.logwarn(f"❌ No valid depth for key '{key}' at ({x}, {y})")
+                    
+                    # Debug: Check what's at that pixel
+                    if (0 <= x < self.depth_image.shape[1] and 0 <= y < self.depth_image.shape[0]):
+                        raw_depth = self.depth_image[y, x]
+                        rospy.loginfo(f"   Raw depth at ({x}, {y}): {raw_depth}")
+                                
             except Exception as e:
-                rospy.logdebug(f"3D position error for {key}: {e}")
+                rospy.logerr(f"3D position error for '{key}': {e}")
 
+        rospy.loginfo(f"Successfully calculated 3D positions for {len(keypoints_3d)}/{len(keypoints_2d)} keys")
         return keypoints_3d
 
     def transform_to_base_frame(self, point_camera):
@@ -709,7 +869,7 @@ class RoboticTypingController:
             horizontal_offset = 0.05  # 5 cm
             # How high above the key surface to move (in meters)
             vertical_clearance = 0.01 # 1 cm
-            x_press_offset = 0.07
+            z_press_offset = 0.05
 
             waypoints = []
 
@@ -731,9 +891,9 @@ class RoboticTypingController:
 
             # 3. Press the key: Move FORWARD horizontally
             press_pose = Pose()
-            press_pose.position.x = target_pos[0] + x_press_offset # Move to target X
+            press_pose.position.x = target_pos[0]  # Move to target X
             press_pose.position.y = target_pos[1]
-            press_pose.position.z = target_pos[2]
+            press_pose.position.z = target_pos[2] + z_press_offset
             press_pose.orientation = current_pose.orientation
             waypoints.append(press_pose)
 
@@ -847,94 +1007,113 @@ class RoboticTypingController:
             self.move_group.clear_pose_targets()
 
     def type_key_joint_space(self, key_name, target_pos):
-        """Joint space typing with better error handling and faster movement"""
+        """
+        MODIFIED: Joint space typing constrained to the workspace with better logging.
+        """
         try:
-            rospy.loginfo(f"🔧 Joint space approach for '{key_name}'")
+            # --- 1. Create and apply workspace path constraints ---
+            constraints = Constraints()
+            constraints.name = "typing_workspace_constraint"
+
+            pc = PositionConstraint()
+            pc.header.frame_id = self.move_group.get_planning_frame()
+            pc.link_name = self.move_group.get_end_effector_link()
+            pc.weight = 1.0
+
+            box_bvolume = moveit_msgs.msg.BoundingVolume()
+            box_primitive = shape_msgs.msg.SolidPrimitive()
+            box_primitive.type = box_primitive.BOX
+            
+            box_dims = [
+                self.workspace_bounds['x_max'] - self.workspace_bounds['x_min'],
+                self.workspace_bounds['y_max'] - self.workspace_bounds['y_min'],
+                self.workspace_bounds['z_max'] - self.workspace_bounds['z_min']
+            ]
+            box_primitive.dimensions = box_dims
+            
+            box_pose = Pose()
+            box_pose.position.x = (self.workspace_bounds['x_max'] + self.workspace_bounds['x_min']) / 2
+            box_pose.position.y = (self.workspace_bounds['y_max'] + self.workspace_bounds['y_min']) / 2
+            box_pose.position.z = (self.workspace_bounds['z_max'] + self.workspace_bounds['z_min']) / 2
+            box_pose.orientation.w = 1.0
+            
+            box_bvolume.primitives.append(box_primitive)
+            box_bvolume.primitive_poses.append(box_pose)
+            pc.constraint_region = box_bvolume
+            
+            constraints.position_constraints.append(pc)
+            self.move_group.set_path_constraints(constraints)
+
+            # --- 2. Proceed with the typing motion plan ---
+            rospy.loginfo(f"🔧 Horizontal Joint Space approach for '{key_name}' with path constraints")
             
             current_pose = self.move_group.get_current_pose().pose
+            self.move_group.set_max_velocity_scaling_factor(0.15)
+            self.move_group.set_max_acceleration_scaling_factor(0.15)
             
-            # Temporarily increase velocity for joint space movements
-            original_vel_scaling = self.move_group.get_max_velocity_scaling_factor()
-            original_acc_scaling = self.move_group.get_max_acceleration_scaling_factor()
-            
-            # Set faster movement for joint space (but still conservative)
-            self.move_group.set_max_velocity_scaling_factor(0.15)  # Increased from 0.05 to 0.15
-            self.move_group.set_max_acceleration_scaling_factor(0.15)  # Increased from 0.05 to 0.15
-            
-            # Approach position
+            horizontal_offset = 0.05
+            x_press_offset = 0.015
+
             approach_pose = Pose()
-            approach_pose.position.x = target_pos[0]
+            approach_pose.position.x = target_pos[0] - horizontal_offset
             approach_pose.position.y = target_pos[1]
-            approach_pose.position.z = target_pos[2] + self.approach_height
+            approach_pose.position.z = target_pos[2]
             approach_pose.orientation = current_pose.orientation
             
             self.move_group.set_pose_target(approach_pose)
-            self.move_group.set_planning_time(10.0)  # Reduced from 15.0
+            self.move_group.set_planning_time(10.0)
             
-            rospy.loginfo("Planning approach movement...")
+            rospy.loginfo("Planning approach movement (to front of key)...")
             approach_plan = self.move_group.plan()
             
+            # --- 3. Check for planning success and provide clear logs ---
             if approach_plan[0]: 
                 rospy.loginfo("Executing approach...")
                 if self.move_group.execute(approach_plan[1], wait=True):
                     rospy.loginfo("✅ Reached approach position")
                     
-                    # Press position - use slower movement for precision
-                    self.move_group.set_max_velocity_scaling_factor(0.15)  # Slower for press
-                    self.move_group.set_max_acceleration_scaling_factor(0.15)
-                    
                     press_pose = Pose()
-                    press_pose.position.x = target_pos[0]
+                    press_pose.position.x = target_pos[0] + x_press_offset
                     press_pose.position.y = target_pos[1]
-                    press_pose.position.z = target_pos[2] - self.press_depth
+                    press_pose.position.z = target_pos[2]
                     press_pose.orientation = current_pose.orientation
                     
                     self.move_group.set_pose_target(press_pose)
                     press_plan = self.move_group.plan()
                     
                     if press_plan[0]:
-                        rospy.loginfo("Executing key press...")
+                        rospy.loginfo("Executing key press (moving forward)...")
                         if self.move_group.execute(press_plan[1], wait=True):
                             rospy.loginfo(f"✅ Pressed key '{key_name}'")
                             rospy.sleep(self.dwell_time)
                             
-                            # Retract - faster movement again
-                            self.move_group.set_max_velocity_scaling_factor(0.05)
-                            self.move_group.set_max_acceleration_scaling_factor(0.05)
-                            
                             self.move_group.set_pose_target(approach_pose)
                             retract_plan = self.move_group.plan()
-                            
                             if retract_plan[0]:
                                 self.move_group.execute(retract_plan[1], wait=True)
                                 rospy.loginfo("✅ Retracted from key")
                             
-                            return True
+                            return True # Typing was successful
                     else:
-                        rospy.logwarn("Press movement planning failed")
+                        rospy.logwarn("!!! Press movement planning FAILED.")
                 else:
-                    rospy.logwarn("Approach movement execution failed")
+                    rospy.logwarn("!!! Approach movement EXECUTION failed.")
             else:
-                rospy.logwarn("Approach movement planning failed")
+                rospy.logwarn("!!! Approach planning FAILED. The robot could not find a valid path within the constraints. Try widening the workspace.")
                 
         except Exception as e:
             rospy.logerr(f"Joint space typing error: {e}")
             
         finally:
-            # Restore original velocity scaling
-            try:
-                self.move_group.set_max_velocity_scaling_factor(original_vel_scaling)
-                self.move_group.set_max_acceleration_scaling_factor(original_acc_scaling)
-            except:
-                # Fallback to default conservative values
-                self.move_group.set_max_velocity_scaling_factor(0.05)
-                self.move_group.set_max_acceleration_scaling_factor(0.05)
-                
+            # --- 4. CRITICAL: Clear constraints and restore state ---
+            self.move_group.clear_path_constraints()
+            rospy.loginfo("Restoring default conservative typing speed (5%).")
+            self.move_group.set_max_velocity_scaling_factor(0.05)
+            self.move_group.set_max_acceleration_scaling_factor(0.05)
             self.move_group.stop()
             self.move_group.clear_pose_targets()
             
-        return False
-
+        return False # Return False if any part of the process fails
 
     def get_robot_status(self):
         try:

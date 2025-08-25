@@ -83,7 +83,6 @@ jobs:
       - name: Debug API Response
         run: |
           echo "--- RAW API RESPONSE ---"
-          cat api_response.json
           echo ""
           echo "------------------------"
 
