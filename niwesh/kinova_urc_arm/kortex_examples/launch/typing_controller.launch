@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Robotic Typing Controller Launch File -->
+    
+    <!-- Robot namespace parameter -->
+    <arg name="robot_namespace" default="my_gen3"/>
+    
+    <!-- Camera topics -->
+    <arg name="depth_topic" default="/camera/depth/image_rect_raw"/>
+    <arg name="color_topic" default="/camera/color/image_raw"/>
+    <arg name="camera_info_topic" default="/camera/color/camera_info"/>
+    
+    <!-- Frame parameters -->
+    <arg name="base_frame" default="base_link"/>
+    <arg name="camera_frame" default="camera_depth_frame"/>
+    
+    <!-- Main robotic typing controller node -->
+    <node name="robotic_typing_controller" pkg="robotic_typing" type="robotic_typing_controller.py" output="screen">
+        <param name="robot_namespace" value="$(arg robot_namespace)"/>
+        <param name="depth_topic" value="$(arg depth_topic)"/>
+        <param name="color_topic" value="$(arg color_topic)"/>
+        <param name="camera_info_topic" value="$(arg camera_info_topic)"/>
+        <param name="base_frame" value="$(arg base_frame)"/>
+        <param name="camera_frame" value="$(arg camera_frame)"/>
+        
+        <!-- Remap topics if needed -->
+        <remap from="/camera/depth/image_rect_raw" to="$(arg depth_topic)"/>
+        <remap from="/camera/color/image_raw" to="$(arg color_topic)"/>
+        <remap from="/camera/color/camera_info" to="$(arg camera_info_topic)"/>
+    </node>
+    
+    <!-- Optional: Launch image viewer for annotated keyboard -->
+    <node name="annotated_keyboard_viewer" pkg="image_view" type="image_view" output="screen" if="false">
+        <remap from="image" to="/annotated_keyboard"/>
+    </node>
+    
+    <!-- Optional: Launch rqt for monitoring -->
+    <node name="rqt_typing_monitor" pkg="rqt_gui" type="rqt_gui" output="screen" if="false">
+        <arg name="perspective-file" value="$(find robotic_typing)/config/typing_monitor.perspective"/>
+    </node>
+
+</launch>

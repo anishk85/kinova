@@ -14,12 +14,14 @@ from geometry_msgs.msg import PointStamped
 # Global variables
 model = None
 bridge = None
-label_id = None  # 39 is the label ID for the bottle class
+label_id = 39  # 39 is the label ID for the bottle class
 depth_image = None
 tf_buffer = None
 tf_listener = None
 image_pub = None
 world_coords_pub = None  # Publisher for world coordinates
+
+
 
 # Camera parameters
 color_info = {
@@ -56,6 +58,7 @@ def init_node():
     rospy.Subscriber("/camera/color/image_raw", Image, image_callback)
     rospy.Subscriber("/camera/depth/image_raw", Image, depth_callback)
 
+
 def depth_callback(msg):
     """Process depth image."""
     global depth_image
@@ -66,6 +69,7 @@ def depth_callback(msg):
             depth_image = bridge.imgmsg_to_cv2(msg, "32FC1")
     except Exception as e:
         rospy.logerr(f"Depth processing error: {e}")
+
 
 def compute_3d_coordinates(u, v, depth):
     """Compute 3D coordinates from depth."""
@@ -92,6 +96,7 @@ def transform_point(camera_coords):
     except (tf2_ros.LookupException, tf2_ros.ExtrapolationException) as e:
         return None
 
+
 def publish_world_coords(world_coords):
     """Publish world coordinates to the topic."""
     if world_coords:
@@ -102,21 +107,29 @@ def publish_world_coords(world_coords):
 
         world_coords_pub.publish(point_msg)
 
-def draw_detections(image, bbox, center, world_coords, class_label):
+
+def draw_detections(image, bbox, center, world_coords, class_label, depth_value=None):
     """Draw bounding boxes and display object coordinates."""
     cv2.rectangle(image, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
     cv2.circle(image, center, 5, (255, 0, 0), -1)
 
     cv2.putText(image, f"{class_label}", (bbox[0], bbox[1] - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-    
-    if not world_coords:
-        rospy.loginfo(f"World coordinates not available for {class_label}")
+
+    if depth_value is not None:
+        cv2.putText(image, f"Depth (cam): {depth_value:.2f} m",
+                (bbox[0], bbox[1] - 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0, (0, 165, 255), 3)   # bigger font + bold
+
 
     if world_coords:
         x_world, y_world, z_world = world_coords
         cv2.putText(image, f"World: ({x_world:.2f}, {y_world:.2f}, {z_world:.2f})m",
                     (bbox[0], bbox[1] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+    else:
+        rospy.loginfo(f"World coordinates not available for {class_label}")
+
 
 def publish_and_display(rendered_image):
     """Publish the processed image and display it."""
@@ -165,13 +178,16 @@ def image_callback(msg):
                             if camera_coords:
                                 world_coords = transform_point(camera_coords)
 
+                            # rospy.loginfo(f"[YOLO] {class_label} | Depth (camera): {depth_value:.2f} m")
+
                     # Publish world coordinates
                     if world_coords:
                         publish_world_coords(world_coords)
 
                     # Get class label and draw detections
                     class_label = model.names[class_id]
-                    draw_detections(rendered_image, (x1, y1, x2, y2), center_rgb, world_coords, class_label)
+                    #draw_detections(rendered_image, (x1, y1, x2, y2), center_rgb, world_coords, class_label)
+                    draw_detections(rendered_image, (x1, y1, x2, y2), center_rgb, world_coords, class_label, depth_value)
 
         publish_and_display(rendered_image)
 
